@@ -1,0 +1,425 @@
+---
+title: "Marker Gene Analysis"
+author: "Dario DF"
+format: html
+editor: visual
+---
+
+## Summary
+
+This markdown contains the marker and differential gene expression analysis step for the Visium HD human embryo dataset. The code was adapted from <https://ludvigla.github.io/semla/articles/visiumHD.html>.
+
+## Load libraries
+
+```{r}
+rm(list = ls())
+library(semla)
+library(stringr)
+library(tidyverse) 
+```
+
+## Set Directories
+
+```{r}
+# server paths
+input.dir <- "/srv/home/dario.dalofonseca/embryo_analysis_data/R_objects"
+
+# add source functions for decomposition provided by Javier Escudero Morlanes (PhD student)
+source("/home/dario.dalofonseca/projects/visium_analysis/scripts/get_hd_barcodes.R")
+```
+
+## Auxilliary functions
+
+```{r}
+# applies data pre-processing to seurat object from normalization to dimensionality reduction
+prepare_seurat_obj <- function(se_obj, mode, include_normalization = TRUE, PCA_dims = 10,
+                               cluster_resolution = 0.2, vars.to.regress = NULL) {
+  
+  # either use log normalization or sct normalization
+  if (include_normalization) {
+    if (mode == "log") {
+     se_obj <- se_obj |> 
+       NormalizeData() |> 
+       ScaleData() |>  
+       FindVariableFeatures(nfeatures = 3000)
+    
+    } else if (mode == "sct") {
+      se_obj <- se_obj |> 
+       SCTransform(assay = "Spatial", vars.to.regress = vars.to.regress)
+   }
+  }
+  
+  se_obj <- se_obj |> 
+    RunPCA() |> 
+    FindNeighbors(reduction = "pca", dims = 1:PCA_dims) |>
+    FindClusters(resolution = cluster_resolution) |>
+    RunUMAP(reduction = "pca", dims = 1:PCA_dims)
+  
+  return(se_obj)
+}
+
+# extract top marker genes for each cluster by adjusted p value (default)
+extract_marker_gene_df <- function(dge.markers, arrange_by ="p_val_adj", num_of_top_genes = 5) {
+  extracted_marker_df <- dge.markers |> 
+    group_by(cluster) |> 
+    arrange(arrange_by) |> 
+    slice_head(n = num_of_top_genes)
+  
+  return(extracted_marker_df)
+}
+
+
+# plot multiple genes spatially or as UMAP
+plot_gene_vector <- function(seurat_obj, vector_of_genes, mode = "spatial", shape = "tile", image_use = "raw", crop_area = NULL, colors = RColorBrewer::brewer.pal(n = 9, name = "Reds"), pt_alpha = 0.5) {
+  for (gene in vector_of_genes) {
+    if (mode == "spatial") {
+    print(MapFeatures(seurat_obj, features = gene, shape = shape, image_use = image_use,
+                      pt_alpha = pt_alpha, crop_area = crop_area, colors = colors))
+  } else if (mode == "umap") {
+    print(FeaturePlot(seurat_obj, features = gene))
+  }}
+}
+
+
+# updated function to allow decompositon from 8 µm to 2 µm but also to specify metadata columns to add
+adjust_decomposed_seurat_obj_2 <- function(decomposed_se_obj, decomposed_resolution, original_se_obj, original_resolution, metadata_columns = c("section", "identity", "tissue")) {
+  # ensure valid resolutions
+  if (decomposed_resolution >= original_resolution) {
+    stop("Decomposed resolution must be finer than the original resolution")
+  }
+  
+  decomposing_factor <- (original_resolution / decomposed_resolution)^2
+  
+  # get identity and tissue annotation from original object metadata
+  metadata_original <- original_se_obj[[]] |> 
+    filter(!is.na(tissue)) |> 
+    dplyr::select(all_of(metadata_columns)) |> 
+    rownames_to_column(var = "barcode_original") # have the barcode as its own column
+  
+  # generate mapping dataframe so one knows which lower resolution tile the decomposed tiles belong to 
+  tiles_mapping_high_res <- decompose_grid(metadata_original$barcode_original, 
+                                           from = original_resolution,
+                                           to = decomposed_resolution,
+                                           coordinates = GetCoordinates(original_se_obj)) 
+  tiles_mapping_high_res <- data.frame(barcode_original = rep(metadata_original$barcode_original, 
+                                                              each = decomposing_factor),  
+                                       barcode_high_res = tiles_mapping_high_res)
+  
+  # update barcodes for lower resolutions to match the decomposed ones 
+  tiles_mapping_high_res$barcode_high_res <- paste0(tiles_mapping_high_res$barcode_high_res, "-1")
+  
+  # merge metadata from original resolution into decomposed barcodes
+  metadata_high_res <- tiles_mapping_high_res |> 
+    left_join(metadata_original, by = "barcode_original") |> 
+    dplyr::select(all_of(c("barcode_high_res", metadata_columns)))
+  
+  # subset higher resolution object and assign metadata
+  se.hd_high_res <- SubsetSTData(decomposed_se_obj, spots = metadata_high_res$barcode_high_res)
+  
+  # convert metadata to Seurat format and update metadata in decomposed object
+  metadata_high_res_df <- se.hd_high_res[[]] |> 
+    rownames_to_column(var = "barcode_high_res") |> 
+    left_join(metadata_high_res, by = "barcode_high_res")
+  
+  rownames(metadata_high_res_df) <- metadata_high_res_df$barcode_high_res
+  metadata_high_res_df <- metadata_high_res_df |> dplyr::select(-barcode_high_res)  # remove extra column
+  se.hd_high_res[[]] <- metadata_high_res_df
+
+  print(se.hd_high_res[[]])
+
+  return(se.hd_high_res)
+}
+```
+
+## Load filtered seurat objects for resolution 2, 8, and 16 µm
+
+```{r}
+se.hd_res16_filt <- readRDS(file.path(input.dir, "se.hd_res16_filt.rds"))
+se.hd_res8_filt <- readRDS(file.path(input.dir, "se.hd_res8_filt.rds"))
+se.hd_res2_filt <- readRDS(file.path(input.dir, "se.hd_res2_filt.rds"))
+```
+
+## Prepare seurat objects
+
+-   the normalization method, the number of used PCA dimensions as well as the cluster resolution was optimized in the clustering_optimization.qmd script
+
+```{r}
+# bin size 16 µm
+se.hd_res16 <- prepare_seurat_obj(se.hd_res16_filt, mode = "log", PCA_dims = 24,
+                                  cluster_resolution = 0.4) # 16 clusters
+
+# bin size 8 µm
+se.hd_res8 <- prepare_seurat_obj(se.hd_res8_filt, mode = "log", PCA_dims = 29,
+                                  cluster_resolution = 0.3) # 17 clusters
+
+# bile size 2 µm
+# prepare resolution 2 neural tube and somit object based on resolution 8 µm object
+se.hd_res8_filt_neural_tube_and_somites <- SubsetSTData(se.hd_res8,
+                                                        Spatial_snn_res.0.3 %in% c(13, 14)) # 13 is neural tube; 14 is somites
+
+se.hd_res2_neural_tube_and_somites <- adjust_decomposed_seurat_obj_2(decomposed_se_obj = se.hd_res2_filt, decomposed_resolution = 2, original_se_obj = se.hd_res8_filt_neural_tube_and_somites, original_resolution = 8, metadata_columns = c("Spatial_snn_res.0.3")) 
+
+se.hd_res2_neural_tube_and_somites_log_PC10 <- prepare_seurat_obj(se.hd_res2_neural_tube_and_somites,
+                                                             mode = "log", PCA_dims = 10,
+                                                             cluster_resolution = 0.3)
+
+# remove spots with zero counts for SCTransform
+se.hd_res2_neural_tube_and_somites_filtered <- SubsetSTData(se.hd_res2_neural_tube_and_somites, nCount_Spatial > 0)
+se.hd_res2_neural_tube_and_somites_sct_PC30 <- prepare_seurat_obj(se.hd_res2_neural_tube_and_somites_filtered,
+                                                                  mode = "sct", PCA_dims = 30,
+                                                                  cluster_resolution = 0.25)
+
+```
+
+## Marker Gene Analysis - resolution 16
+
+-   for log.fc threshold = 1 (2-fold expression difference) & log.fc threshold = log2(1.5) (1.5-fold expression difference)
+
+```{r}
+de.markers_res16 <- FindAllMarkers(se.hd_res16, assay = "Spatial", slot = "data",
+                                   logfc.threshold = 1, only.pos = TRUE,
+                                   return.threshold = 0.05)
+head(de.markers_res16)
+```
+
+```{r}
+table(de.markers_res16$cluster)
+table(de.markers_res16[de.markers_res16$p_val_adj < 0.05,]$cluster)
+```
+
+### Top marker gene associated with each cluster
+
+-   plot spatially and as UMAP
+
+```{r, fig.height=10, fig.width=10}
+de.markers.1 <- extract_marker_gene_df(de.markers_res16, num_of_top_genes = 1)
+
+plot_gene_vector(se.hd_res16, vector_of_genes = de.markers.1$gene, mode = "spatial")
+plot_gene_vector(se.hd_res16, vector_of_genes = de.markers.1$gene, mode = "umap")
+```
+
+### Dotplots & Heatmaps
+
+-   top 5 marker genes as dotplot
+
+```{r, fig.height = 10, fig.width = 19}
+top_genes <- extract_marker_gene_df(de.markers_res16, num_of_top_genes = 5)$gene
+
+DotPlot(se.hd_res16, features = unique(top_genes)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5,
+                                   color = ifelse(grepl("^HOX", unique(top_genes)), "purple",  # HOX ; 
+                                                  "black")))
+
+```
+
+-   top 10 / 20 genes as heatmap
+
+```{r, fig.height = 35}
+de.markers.10 <- extract_marker_gene_df(de.markers_res16, num_of_top_genes = 10)
+de.markers.20 <- extract_marker_gene_df(de.markers_res16, num_of_top_genes = 20)
+#de.markers.30 <- extract_marker_gene_df(de.markers_res16, num_of_top_genes = 30)
+# write.xlsx(de.markers.20, "top20_genes_res16_cl0.4.xlsx") # write to external excel sheet for manual analysis
+
+DoHeatmap(se.hd_res16, features = de.markers.10$gene)
+DoHeatmap(se.hd_res16, features = de.markers.20$gene)
+#DoHeatmap(se.hd_res16, features = de.markers.30$gene)
+```
+
+## Marker Gene Analysis - resolution 8
+
+-   for log.fc threshold = 1 (2-fold expression difference) & log.fc threshold = log2(1.5) (1.5-fold expression difference)
+
+```{r}
+de.markers_res8 <- FindAllMarkers(se.hd_res8, assay = "Spatial", slot = "data",
+                                  logfc.threshold = 1,
+                                  only.pos = TRUE, return.threshold = 0.05) # uses resolution 0.3
+```
+
+-   summarize number of marker genes per cluster for raw and adjusted p value \< 0.05
+
+```{r}
+table(de.markers_res8$cluster)
+table(de.markers_res8[de.markers_res8$p_val_adj < 0.05,]$cluster)
+```
+
+### Top marker gene for each cluster
+
+```{r, fig.height = 5, fig.width = 5}
+de.markers_res8_top1 <- extract_marker_gene_df(de.markers_res8, num_of_top_genes = 1)
+plot_gene_vector(se.hd_res8, de.markers_res8_top1$gene, mode = "spatial")
+plot_gene_vector(se.hd_res8, de.markers_res8_top1$gene, mode = "umap")
+DimPlot(se.hd_res8, reduction = "umap", label = TRUE)
+```
+
+### Dotplots & Heatmaps
+
+```{r, fig.height = 11, fig.width = 19}
+top_genes <- extract_marker_gene_df(de.markers_res8, num_of_top_genes = 5)$gene
+
+DotPlot(se.hd_res8, features = unique(top_genes)) +
+ # scale_colour_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, 
+                       # limits = c(-2.5, 2.5), oob = scales::squish) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5,
+                                   color = ifelse(grepl("^MT", unique(top_genes)), "darkred",
+                                                  "black")))
+```
+
+```{r}
+de.markers_res8_top10 <- extract_marker_gene_df(de.markers_res8, num_of_top_genes = 10)
+#de.markers_res8_top20 <- extract_marker_gene_df(de.markers_res8, num_of_top_genes = 20)
+#de.markers_res8_top30 <- extract_marker_gene_df(de.markers_res8, num_of_top_genes = 30)
+# write.xlsx(de.markers.20, "top20_genes_res16_cl0.4.xlsx") # write to external excel sheet for manual analysis
+
+DoHeatmap(se.hd_res8, features = de.markers_res8_top10$gene) # heatmap shows that cluster 6 has no clear  marker genes --> noise
+#DoHeatmap(se.hd_res8, features = de.markers_res8_top20$gene)
+#DoHeatmap(se.hd_res8, features = de.markers_res8_top30$gene)
+#heatmap_plot <- DoHeatmap(se.hd_res8, features = extract_marker_gene_df(de.markers_res8,
+                                                           # num_of_top_genes = 20)$gene)
+#ggsave(filename = "heatmap_8.png", plot = heatmap_plot, width = 36, height = 32, dpi = 300)
+```
+
+## Marker Gene Analysis - resolution 2 µm (somites & neural tube)
+
+### Broad clusters (log norm)
+
+```{r}
+de.markers_res2_log <- FindAllMarkers(se.hd_res2_neural_tube_and_somites_log_PC10,
+                                      assay = "Spatial", slot = "data",
+                                      logfc.threshold = log2(1.5), only.pos = TRUE,
+                                      return.threshold = 0.05)
+```
+
+```{r}
+table(de.markers_res2_log$cluster)
+```
+
+#### Top marker gene for each cluster
+
+```{r, fig.height = 10, fig.width = 10}
+de.markers_res2_log_top1 <- extract_marker_gene_df(de.markers_res2_log, num_of_top_genes = 5)
+plot_gene_vector(se.hd_res2_neural_tube_and_somites_log_PC10, de.markers_res2_log_top1$gene,
+                 mode = "spatial", crop_area = c(0.2693,0.25,0.305,0.294))
+plot_gene_vector(se.hd_res2_neural_tube_and_somites_log_PC10, de.markers_res2_log_top1$gene,
+                 mode = "umap")
+DimPlot(se.hd_res2_neural_tube_and_somites_log_PC10, reduction = "umap", label = TRUE)
+```
+
+-   adjusted color code
+
+```{r, fig.height = 4, fig.width = 4}
+DimPlot(se.hd_res2_neural_tube_and_somites_log_PC10, reduction = "umap", cols = c("#1f4e79", "#E6E6FA", "orange", "#03C04A", "magenta")) #label = TRUE
+```
+
+```{r, fig.height = 5, fig.width = 5}
+MapLabels(SubsetSTData(se.hd_res2_neural_tube_and_somites_log_PC10, section == "D"), column_name = "seurat_clusters", override_plot_dims = TRUE, colors = c("#1f4e79", "#E6E6FA", "orange", "#03C04A", 	"magenta"), shape = "tile")
+```
+
+#### Dotplots & Heatmaps
+
+```{r, fig.height = 5, fig.width = 14}
+top_genes <- extract_marker_gene_df(de.markers_res2_log, num_of_top_genes = 10)$gene
+
+DotPlot(se.hd_res2_neural_tube_and_somites_log_PC10, features = top_genes) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5,
+                                   color = ifelse(grepl("^MT", top_genes),
+                                                  "darkred", "black")))
+```
+
+```{r}
+#heatmap can be visualized if done externally
+heatmap_plot <- DoHeatmap(se.hd_res2_neural_tube_and_somites_log_PC10, 
+                          features = extract_marker_gene_df(de.markers_res2_log,
+                                                            num_of_top_genes = 20)$gene)
+ggsave(filename = "heatmap_2_log.png", plot = heatmap_plot, width = 16, height = 14, dpi = 300)
+```
+
+### Fine clustering (based on SCTransform)
+
+```{r}
+de.markers_res2_sct <- FindAllMarkers(se.hd_res2_neural_tube_and_somites_sct_PC30,
+                                      assay = "SCT", logfc.threshold = log2(1.5),
+                                      only.pos = TRUE, return.thresh = 0.05)
+```
+
+```{r}
+table(de.markers_res2_sct$cluster)
+table(de.markers_res2_sct[de.markers_res2_sct$p_val_adj < 0.05,]$cluster)
+```
+
+#### Top marker gene for each cluster
+
+```{r, fig.height = 10, fig.width = 10}
+de.markers_res2_sct_top1 <- extract_marker_gene_df(de.markers_res2_sct, num_of_top_genes = 1)
+plot_gene_vector(se.hd_res2_neural_tube_and_somites_sct_PC30, de.markers_res2_sct_top1$gene,
+                 mode = "spatial", crop_area = c(0.2693,0.25,0.305,0.294), image_use = "raw",
+                 pt_alpha = 0.5) # colors = viridis::turbo(11)
+plot_gene_vector(se.hd_res2_neural_tube_and_somites_sct_PC30, de.markers_res2_sct_top1$gene,
+                 mode = "umap")
+DimPlot(se.hd_res2_neural_tube_and_somites_sct_PC30, reduction = "umap", label = TRUE)
+```
+
+#### Dotplots & Heatmaps
+
+```{r, fig.width = 15}
+top_genes <- extract_marker_gene_df(de.markers_res2_sct, num_of_top_genes = 3)$gene
+
+DotPlot(se.hd_res2_neural_tube_and_somites_sct_PC30, features = unique(top_genes)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5,
+                                   color = ifelse(grepl("^MT", unique(top_genes)), "darkred",
+                                                  "black")))
+```
+
+```{r}
+p <- DoHeatmap(se.hd_res2_neural_tube_and_somites_sct_PC30, 
+               features = extract_marker_gene_df(de.markers_res2_sct,
+                                                 num_of_top_genes = 5)$gene, slot = "data")
+
+ggsave(filename = "heatmap_res2_sct.png", plot = p, width = 25, height = 15, dpi = 300)
+```
+
+## Extra: Sex determination through Y-chromosomal markers
+
+-   y chromosomal markers
+
+```{r, fig.height = 5, fig.width = 5}
+# Y chromosome genes potentially expressed in CS10-11 stage human embryo
+y_genes_CS11 <- c("EIF1AY", "ZFY", "SRY", "DDX3Y", "KDM5D")
+
+plot_gene_vector(se.hd_res16, y_genes_CS11, mode = "spatial", crop_area = c(0.03, 0.07, 0.87, 0.83))
+plot_gene_vector(se.hd_res16, y_genes_CS11, mode = "umap")
+# we can see expression --> male embryo
+```
+
+-   violin and bar plot for expression of Y-chromosomal genes
+
+```{r, fig.height = 4, fig.width = 6.2}
+expr_data <- GetAssayData(se.hd_res16, slot = "counts")[y_genes_CS11, ]  
+expr_df <- as.data.frame(t(as.matrix(expr_data)))
+expr_long <- pivot_longer(expr_df, cols = everything(), names_to = "Gene", values_to = "Expression")
+
+ggplot(expr_long, aes(x = Gene, y = Expression, fill = Gene)) +
+  geom_violin(alpha = 0.7) +   #geom_violin(alpha = 0.7)
+  theme_bw() +  
+  theme(panel.grid.major = element_blank(),  
+        panel.grid.minor = element_blank()) +  
+  scale_y_continuous(breaks = seq(0, max(expr_long$Expression), by = 1)) + 
+  labs(title = "Counts of Y-Chromosomal Genes Across 16 µm Bins", x = "Gene", y = "Counts")
+
+percent_expr_spots <- expr_long %>%
+  group_by(Gene) %>%
+  summarise(PercentExpressing = mean(Expression > 0) * 100)
+
+ggplot(percent_expr_spots, aes(x = Gene, y = PercentExpressing, fill = Gene)) +
+  geom_col(color = "black") +
+  theme_bw() +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 60)) +
+  labs(title = "Expression of Y-Chromosomal Genes Across 16 µm Bins",
+       y = "Percentage of Expressing Bins (%)", x = "Gene")
+```
+
+## Session Info
+
+```{r}
+date()
+sessionInfo()
+```

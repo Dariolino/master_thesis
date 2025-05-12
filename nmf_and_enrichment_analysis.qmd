@@ -1,0 +1,568 @@
+---
+title: "Non-negative matrix factorization & functional enrichment analysis"
+author: "Dario DF"
+format: html
+editor: visual
+---
+
+## Summary
+
+This markdown contains the non-negative matrix factorization (NMF) and functional enrichment analysis step for the Visium HD human embryonic data set. The code was adapted from <https://ludvigla.github.io/semla/articles/visiumHD.html>.
+
+## Load Libraries
+
+```{r}
+rm(list = ls())
+library(semla)
+library(singlet)
+library(stringr)
+library(tidyverse) 
+library(enrichplot)
+library(gprofiler2) # for FEA
+library(rrvgo) # for revigo plots summarizing GO terms
+```
+
+## Set directories
+
+```{r}
+# server paths
+input.dir <- "/srv/home/dario.dalofonseca/embryo_analysis_data/R_objects"
+out.dir <- "/srv/home/dario.dalofonseca/embryo_analysis_data/R_objects"
+
+# add source functions for bin decomposition
+source("/home/dario.dalofonseca/projects/visium_analysis/scripts/get_hd_barcodes.R")
+```
+
+## Auxilliary functions
+
+```{r}
+# applies data pre-processing to seurat object from normalization to dimensionality reduction
+prepare_seurat_obj <- function(se_obj, mode, include_normalization = TRUE, PCA_dims = 10,
+                               cluster_resolution = 0.2, vars.to.regress = NULL) {
+  
+  # either use log normalization or sct normalization
+  if (include_normalization) {
+    if (mode == "log") {
+     se_obj <- se_obj |> 
+       NormalizeData() |> 
+       ScaleData() |>  
+       FindVariableFeatures(nfeatures = 3000)
+    
+    } else if (mode == "sct") {
+      se_obj <- se_obj |> 
+       SCTransform(assay = "Spatial", vars.to.regress = vars.to.regress)
+   }
+  }
+  
+  se_obj <- se_obj |> 
+    RunPCA() |> 
+    FindNeighbors(reduction = "pca", dims = 1:PCA_dims) |>
+    FindClusters(resolution = cluster_resolution) |>
+    RunUMAP(reduction = "pca", dims = 1:PCA_dims)
+  
+  return(se_obj)
+}
+
+# plot multiple genes spatially or as UMAP
+plot_gene_vector <- function(seurat_obj, vector_of_genes, mode = "spatial",
+                             shape = "tile", image_use = "raw", crop_area = NULL,
+                             colors = RColorBrewer::brewer.pal(n = 9, name = "Reds"),
+                             pt_alpha = 0.5) {
+  
+  for (gene in vector_of_genes) {
+    if (mode == "spatial") {
+    print(MapFeatures(seurat_obj, features = gene, shape = shape, image_use = image_use,
+                      pt_alpha = pt_alpha, crop_area = crop_area, colors = colors))
+  } else if (mode == "umap") {
+    print(FeaturePlot(seurat_obj, features = gene))
+  }}
+}
+
+
+# updated version to allow decompositon from 8 µm to 2 µm but also to specify metadata columns to add
+adjust_decomposed_seurat_obj_2 <- function(decomposed_se_obj, decomposed_resolution,
+                                           original_se_obj, original_resolution,
+                                           metadata_columns = c("section", "identity", "tissue")) {
+  # ensure valid resolutions
+  if (decomposed_resolution >= original_resolution) {
+    stop("Decomposed resolution must be finer than the original resolution")
+  }
+  
+  decomposing_factor <- (original_resolution / decomposed_resolution)^2
+  
+  # get identity and tissue annotation from original object metadata
+  metadata_original <- original_se_obj[[]] |> 
+    filter(!is.na(tissue)) |> 
+    dplyr::select(all_of(metadata_columns)) |> 
+    rownames_to_column(var = "barcode_original") # have the barcode as its own column
+  
+  # generate mapping dataframe so one knows which lower resolution tile the decomposed tiles belong to 
+  tiles_mapping_high_res <- decompose_grid(metadata_original$barcode_original, 
+                                           from = original_resolution,
+                                           to = decomposed_resolution,
+                                           coordinates = GetCoordinates(original_se_obj)) 
+  tiles_mapping_high_res <- data.frame(barcode_original = rep(metadata_original$barcode_original, 
+                                                              each = decomposing_factor),  
+                                       barcode_high_res = tiles_mapping_high_res)
+  
+  # update barcodes for lower resolutions to match the decomposed ones 
+  tiles_mapping_high_res$barcode_high_res <- paste0(tiles_mapping_high_res$barcode_high_res, "-1")
+  
+  # merge metadata from original resolution into decomposed barcodes
+  metadata_high_res <- tiles_mapping_high_res |> 
+    left_join(metadata_original, by = "barcode_original") |> 
+    dplyr::select(all_of(c("barcode_high_res", metadata_columns)))
+  
+  # subset higher resolution object and assign metadata
+  se.hd_high_res <- SubsetSTData(decomposed_se_obj, spots = metadata_high_res$barcode_high_res)
+  
+  # convert metadata to Seurat format and update metadata in decomposed object
+  metadata_high_res_df <- se.hd_high_res[[]] |> 
+    rownames_to_column(var = "barcode_high_res") |> 
+    left_join(metadata_high_res, by = "barcode_high_res")
+  
+  rownames(metadata_high_res_df) <- metadata_high_res_df$barcode_high_res
+  metadata_high_res_df <- metadata_high_res_df |> dplyr::select(-barcode_high_res)  # remove extra column
+  se.hd_high_res[[]] <- metadata_high_res_df
+
+  print(se.hd_high_res[[]])
+
+  return(se.hd_high_res)
+}
+
+
+## for FEA
+
+# extracts and sorts gene loadings from NMF, returning a long-format table grouped by factor.
+extract_sorted_gene_loadings <- function(se_obj) { # se obj requires nnmf loading
+  
+  # fetch feature.loadings from DimReduc object
+  nmf_loadings <- se_obj[["nmf"]]@feature.loadings
+  
+  # convert to long format and group data by factor
+  gene_loadings_sorted <- nmf_loadings |> 
+    as.data.frame() |> 
+    tibble::rownames_to_column(var = "gene") |> 
+    as_tibble() |> 
+    tidyr::pivot_longer(all_of(colnames(nmf_loadings)), names_to = "fctr",
+                        values_to = "loading") |> 
+    mutate(fctr = factor(fctr, colnames(nmf_loadings))) |> 
+    group_by(fctr) |> 
+    arrange(fctr, -loading)
+  
+  # extract top genes per factor
+  return(gene_loadings_sorted)
+    #slice_head(n = num_of_top_genes) 
+} 
+
+# converts g:profiler2 results into an enrichResult object for visualization with enrichplot
+convert_gost_to_enrich_obj <- function(gost_results, sort_by_p_val = FALSE) {
+
+  # ensure essential columns exist
+  required_cols <- c("query", "source", "term_id", "term_name", "p_value", 
+                     "query_size", "intersection_size", "term_size", 
+                     "effective_domain_size", "intersection")
+
+  # modify g:Profiler data frame to match enrichResult format
+  gp_mod <- gost_results[, required_cols]  # Select only the necessary columns
+
+  # compute gene and background ratios 
+  gp_mod$GeneRatio <- paste0(gp_mod$intersection_size, "/", gp_mod$query_size)
+  gp_mod$BgRatio <- paste0(gp_mod$term_size, "/", gp_mod$effective_domain_size)
+
+  # rename columns to match enrichResult structure
+  colnames(gp_mod) <- c("Cluster", "Category", "ID", "Description", "p.adjust", 
+                         "query_size", "Count", "term_size", "effective_domain_size", 
+                         "geneID", "GeneRatio", "BgRatio")
+
+  # replace commas with slashes in geneID (intersection column)
+  gp_mod$geneID <- gsub(",", "/", gp_mod$geneID)
+
+  # set row names as term IDs
+  gp_mod <- gp_mod |> mutate(Identifier = ID)  
+
+  
+  print(gp_mod)
+  
+  if (sort_by_p_val) {
+    gp_mod <- gp_mod |>
+      arrange(p.adjust) |>
+      mutate(Description = paste0(Description, " (", Category, ")"))  # adds database to term name
+  }
+  
+  print(gp_mod)
+  # define as enrichResult object # the returned object is errorenous but it still allows for correct visualization
+  enrich_obj <- new("enrichResult", result = gp_mod, keytype = "SYMBOL")
+  return(enrich_obj)
+}
+
+
+# performs enrichment analysis on top genes from a selected NMF factor and optionally visualizes results with a treemap or returns an enrichResult object
+analyze_NNMF_factor <- function(sorted_gene_loadings, nnmf_factor, num_of_considered_genes = 50,
+                                ordered_query = TRUE, custom_bg = NULL, return_enrich_obj = FALSE, 
+                                show_treeplot = TRUE, sources = NULL,
+                                sort_by_p_val = FALSE){ # make sources GO:BP to screen # treeplot only possible for GP:BP for right now
+  
+  # get gene sets
+  gene_set_nmf <- sorted_gene_loadings |> 
+    filter(fctr == paste0("NMF_", nnmf_factor)) |> 
+    slice_head(n = num_of_considered_genes)  
+  
+  print(gene_set_nmf)
+  
+  # run FEA
+  fea_results_nmf <- gost(query = gene_set_nmf$gene, ordered_query = ordered_query,
+                          organism = "hsapiens", custom_bg = custom_bg, evcodes = TRUE,
+                          sources = sources) # sources = "GO:BP
+  print(fea_results_nmf$result)
+  print(gostplot(fea_results_nmf, capped = FALSE, interactive = FALSE))
+  fea_results_nmf <- fea_results_nmf$result |> as_tibble() |> filter(term_id != "WP:000000")
+  # removing the placeholder WP:000000 only matters when WP was one of the database sources
+
+  print(fea_results_nmf)
+  
+  #print(fea_results_nmf |> dplyr::select(p_value, term_size, query_size, intersection_size, term_name, term_id))
+  
+  if (show_treeplot) {  # do revigo plots
+  simMatrix <- calculateSimMatrix(fea_results_nmf$term_id, orgdb="org.Hs.eg.db",
+                                ont="BP", method="Rel") 
+  
+  scores <- setNames(-log10(fea_results_nmf$p_value), fea_results_nmf$term_id)
+  reducedTerms <- reduceSimMatrix(simMatrix, scores, threshold=0.7,
+                                orgdb="org.Hs.eg.db")
+  treemapPlot(reducedTerms)
+  #heatmapPlot(simMatrix, reducedTerms, annotateParent=TRUE,
+         #   annotationLabel="parentTerm", fontsize=6)
+  }
+  
+  if (return_enrich_obj) {
+    return(convert_gost_to_enrich_obj(fea_results_nmf, sort_by_p_val = sort_by_p_val))
+  } 
+}
+```
+
+## Load filtered seurat objects for resolution 2, 8, and 16 µm
+
+```{r}
+se.hd_res16_filt <- readRDS(file.path(input.dir, "se.hd_res16_filt.rds"))
+se.hd_res8_filt <- readRDS(file.path(input.dir, "se.hd_res8_filt.rds"))
+se.hd_res2_filt <- readRDS(file.path(input.dir, "se.hd_res2_filt.rds"))
+```
+
+## Prepare seurat objects
+
+```{r}
+se.hd_res16 <- prepare_seurat_obj(se.hd_res16_filt, mode = "log", PCA_dims = 24,
+                                  cluster_resolution = 0.4) # 16 clusters
+
+se.hd_res8 <- prepare_seurat_obj(se.hd_res8_filt, mode = "log", PCA_dims = 29,
+                                  cluster_resolution = 0.3) # 17 clusters
+
+# prepare resolution 2 neural tube and somit object based on resolution 8 µm object
+se.hd_res8_filt_neural_tube_and_somites <- SubsetSTData(se.hd_res8,
+                                                        Spatial_snn_res.0.3 %in% c(13, 14)) # 13 is neural tube; 14 is somites
+
+se.hd_res2_neural_tube_and_somites <- adjust_decomposed_seurat_obj_2(decomposed_se_obj = se.hd_res2_filt,
+                                                                     decomposed_resolution = 2,
+                                                                     original_se_obj = se.hd_res8_filt_neural_tube_and_somites,
+                                                                     original_resolution = 8,
+                                                                     metadata_columns = c("Spatial_snn_res.0.3")) 
+
+print(se.hd_res2_neural_tube_and_somites[[]])
+
+se.hd_res2_neural_tube_and_somites <- prepare_seurat_obj(se.hd_res2_neural_tube_and_somites,
+                                                             mode = "log", PCA_dims = 10,
+                                                             cluster_resolution = 0.3)
+```
+
+## Sanity check
+
+```{r, fig.width = 15, fig.width = 15}
+MapLabels(se.hd_res16, column_name = "seurat_clusters", shape = "tile")
+MapLabels(se.hd_res8, column_name = "seurat_clusters", shape = "tile")
+MapLabels(se.hd_res2_neural_tube_and_somites, column_name = "seurat_clusters",
+          shape = "tile")
+```
+
+## Resolution 16 µm
+
+### NMF
+
+-   using variable features (3000)
+
+<!-- -->
+
+-   prepare assay object only containing variable features
+
+```{r}
+se.hd_res16[["Spatial_var"]] <- CreateAssayObject(data = subset(se.hd_res16[["Spatial"]], 
+                                                           features = VariableFeatures(se.hd_res16))$data) #use data so that normalization is based on all features
+# for all features, use: se.hd_res16[["Spatial_all"]] <- CreateAssayObject(data = se.hd_res16[["Spatial"]]$data)
+```
+
+-   run NMF and plot rank plot showing the determined number of factors
+
+```{r}
+set.seed(42) 
+se.hd_res16 <- RunNMF(se.hd_res16, assay = "Spatial_var", reps = 3) 
+RankPlot(se.hd_res16)
+```
+
+-   extract spot and gene contributions
+
+```{r}
+nnmf_res16 <- se.hd_res16@reductions$nmf
+  
+H_16 <- nnmf_res16@cell.embeddings
+W_16 <- nnmf_res16@feature.loadings
+                               
+cat("Spot contribution:\n")
+head(H_16)
+
+cat("\nGene contribution:\n")
+head(W_16)
+```
+
+```{r, fig.height = 30, fig.width = 15}
+# grab the total number of factors that have been identified. #fig.width = 45, fig.width = 45 # fig.height = 30, fig.width = 15
+k <- ncol(H_16)
+
+MapFeatures(se.hd_res16, features = paste0("NMF_", 1:k),
+            override_plot_dims = TRUE, image_use = "raw",
+            scale = "free", shape = "tile", ncol = 6,
+            colors = viridis::magma(n = 11, direction = -1)
+) &
+  theme(legend.text = element_text(angle = 50),
+        strip.text = element_blank(),
+        plot.title = element_blank()) 
+```
+
+-   plot genes contributing to a factor
+
+```{r, fig.height = 4.5, fig.width = 3.5} #fig.height = 4.5}
+PlotFeatureLoadings(se.hd_res16, 
+                    dims = 23,
+                    reduction = "nmf", 
+                    nfeatures = 30,
+                    mode = "dotplot", 
+                    fill = "darkmagenta",
+                    pt_size = 3)   
+```
+
+-   plot non overlapping factors
+
+```{r, fig.height = 10, fig.width = 10}
+factor_colors <- c('#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', 
+                   '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', 
+                   '#008080', '#e6beff', '#9a6324', '#fffac8', '#800000',
+                   '#aaffc3', "darkgreen", "darkblue", "turquoise", "black",
+                   "pink", "blue", "brown")
+
+# dplyr:select non-overlapping factors # ilfet ot NMF 23
+selected_factors <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                      18, 19, 20, 21, 22, 23)
+
+#MapMultipleFeatures(se.hd_res16, features = paste0("NMF_", selected_factors), 
+           #         colors = factor_colors, image_use = "raw", crop_area = c(0.03, 0.07, 0.87, 0.83),
+           #.        shape = "tile")
+
+## 8 µm resolution
+#factor_colors <- c('#e6194b', '#3cb44b', '#ffe119', 'black', '#f58231',  # these are the factor colors for 8 µm resolution
+#                   '#911eb4', '#46f0f0', '#f032e6', '#fabebe', '#4363d8', 
+ #                  '#bcf60c')
+#selected_factors <- c(1,2,3,4,5,6,7,8,9,10,11)
+
+MapMultipleFeatures(se.hd_res16, features = paste0("NMF_", selected_factors), 
+                    colors = factor_colors, image_use = NULL, crop_area = c(0.03, 0.07, 0.87, 0.83),
+                    override_plot_dims = FALSE, shape = "tile")
+```
+
+-   explore gene contributions as heatmap
+
+```{r, fig.height = 10, fig.width = 15}
+PlotFeatureLoadings(se.hd_res16, dims = selected_factors,    # fig.height = 33, fig.width = 12 for top 10 genes  # fig.height = 33, fig.width = 30 for top 20; now res 8: 
+                    reduction = "nmf", nfeatures = 5, 
+                    mode = "heatmap", 
+                    gradient_colors = viridis::magma(n = 11, direction = -1))
+```
+
+### FEA
+
+-   only GO:BP enrichment
+
+```{r}
+test1 <- extract_sorted_gene_loadings(se.hd_res16) |> 
+  analyze_NNMF_factor(1, 50, custom_bg = Features(se.hd_res16), return_enrich_obj = TRUE, ordered_query = TRUE, show_treeplot = TRUE,
+                      sources = "GO:BP", sort_by_p_val = FALSE) # multiple testing correction dependent on selected sources # if only one source is used - the sort by p val argument is redundant
+```
+
+-   enrichment in multiple DBs
+
+```{r}
+test1 <- extract_sorted_gene_loadings(se.hd_res16) |> 
+  analyze_NNMF_factor(11, 50, custom_bg = Features(se.hd_res16), return_enrich_obj = TRUE, ordered_query = TRUE, show_treeplot = FALSE,
+                      sources = NULL, sort_by_p_val = TRUE) # multiple testing correct dependent on selected sources
+```
+
+-   dot plot visualization
+
+```{r, fig.height = 15, fig.width =8}
+dotplot(test1, showCategory = 20)  # fig.height = 10, fig.width =8
+```
+
+## Resolution 8 µm
+
+### NMF
+
+-   using only variable features
+
+```{r}
+se.hd_res8[["Spatial_var"]] <- CreateAssayObject(data = subset(se.hd_res8[["Spatial"]], 
+                                                           features = VariableFeatures(se.hd_res8))$data)
+
+# for all feature use: se.hd_res8[["Spatial_all"]] <- CreateAssayObject(data = se.hd_res8[["Spatial"]]$data)
+```
+
+```{r}
+set.seed(42)
+se.hd_res8 <- RunNMF(se.hd_res8, assay = "Spatial_var", reps = 3) 
+RankPlot(se.hd_res8)
+```
+
+```{r, fig.height = 4.5, fig.width = 2.9}
+PlotFeatureLoadings(se.hd_res8, 
+                    dims = 11, # allantois? #11 is also intersting
+                    reduction = "nmf", 
+                    nfeatures = 30,
+                    mode = "dotplot", 
+                    fill = "darkmagenta",
+                    pt_size = 3) +
+  theme_bw() +
+  theme(axis.text.y = element_text(color = "black"),
+      axis.text.x = element_text(color = "black")) +
+  ggtitle("NMF Factor 11")
+
+```
+
+```{r, fig.height = 16, fig.width = 16}
+MapFeatures(se.hd_res8, features = paste0("NMF_", 1:11),
+            override_plot_dims = FALSE, image_use = NULL, crop_area = c(0.03, 0.07, 0.87, 0.83),
+            scale = "free", shape = "tile", ncol = 4,
+            colors = viridis::magma(n = 11, direction = -1)
+) &
+  theme(legend.text = element_text(angle = 50),
+        strip.text = element_blank(),
+        plot.title = element_blank()) 
+```
+
+-   for single NMFs
+
+```{r, fig.height = 4, fig.width = 4}
+MapFeatures(se.hd_res8, features = paste0("NMF_", 11),
+            override_plot_dims = FALSE, image_use = NULL, crop_area = c(0.03, 0.07, 0.87, 0.83),
+            scale = "free", shape = "tile",
+            colors = viridis::magma(n = 11, direction = -1)
+) &
+  theme(legend.text = element_text(angle = 50),
+        strip.text = element_blank(),
+        plot.title = element_blank()) 
+```
+
+### FEA
+
+-   enrichment GO:BP
+
+```{r, fig.height = 3.2, fig.width = 3.8}
+test2 <- extract_sorted_gene_loadings(se.hd_res8) |> 
+  analyze_NNMF_factor(11, 50, custom_bg = Features(se.hd_res8), return_enrich_obj = TRUE, ordered_query = TRUE, show_treeplot = TRUE,
+                      sources = "GO:BP", sort_by_p_val = FALSE) # multiple testing correct dependent on selected sources 
+```
+
+-   enrichment in multiple DBs
+
+```{r}
+test2 <- extract_sorted_gene_loadings(se.hd_res8) |> 
+  analyze_NNMF_factor(6, 50, custom_bg = Features(se.hd_res8), return_enrich_obj = TRUE, ordered_query = TRUE, show_treeplot = FALSE,
+                      sources = NULL, sort_by_p_val = TRUE) # multiple testing correction dependent on selected sources 
+```
+
+-   dotplot visualization
+
+```{r, fig.height = 16, fig.width =8}
+dotplot(test2, showCategory = 20)
+```
+
+-   dotplots for thesis
+
+```{r, fig.height = 5, fig.width =9}
+p <- dotplot(test2, showCategory = 10, label_format = 40)
+
+p + ggtitle("GO:BP Enriched Terms - NMF 10") + theme(
+  plot.title = element_text(face = "bold", size = 15.5, hjust = 0.5),
+  axis.title.x = element_text(face = "bold", size = 15),
+  axis.title.y = element_text(face = "bold"),
+  axis.text.x = element_text(size = 15),
+  axis.text.y = element_text(face = "bold", size = 15),
+  legend.title = element_text(face = "bold", size = 15), #   legend.title = element_text(face = "bold", size = 15),
+  legend.text = element_text(size = 15),
+  panel.border = element_rect(color = "black", fill = NA, size =0.8)
+) 
+```
+
+## Resolution 2 µm
+
+-   does not work due to data sparsity
+
+```{r}
+se.hd_res2_neural_tube_and_somites[["Spatial_var"]] <- CreateAssayObject(data = subset(se.hd_res2_neural_tube_and_somites[["Spatial"]], 
+                                                           features = VariableFeatures(se.hd_res2_neural_tube_and_somites))$data)
+```
+
+```{r}
+set.seed(42)
+se.hd_res2_neural_tube_and_somites <- RunNMF(se.hd_res2_neural_tube_and_somites, assay = "Spatial_var", k = NULL)  #throws error due to sparsity
+#RankPlot(se.hd_res2_neural_tube_and_somites)
+```
+
+-   alternative methods required
+
+## Extract 2 µm object for topological data analysis in python
+
+```{r}
+# subset to only have section A
+se_res2_A <- SubsetSTData(se.hd_res2_neural_tube_and_somites, section == "A")
+GetCoordinates(se_res2_A)
+```
+
+```{r}
+MapLabels(se_res2_A, column_name = "seurat_clusters")
+```
+
+```{r}
+se_res2_A[[]]
+```
+
+```{r}
+# extract coordinates and cluster information
+coords <- as.data.frame(GetCoordinates(se_res2_A))
+clusters <- se_res2_A[[]]$seurat_clusters
+
+# convert to data.table
+se_res2_A_coords_clusters <- data.frame(
+  barcode = coords$barcode,  # Barcodes from rownames
+  x = coords$x,  # X coordinates
+  y = coords$y,  # Y coordinates
+  cluster = clusters)  # Cluster labels)
+
+print(se_res2_A_coords_clusters)
+
+# save as CSV
+write_csv(se_res2_A_coords_clusters, file.path(out.dir, "se_res2_A_coords_clusters.csv"))
+```
+
+## Session Info
+
+```{r}
+date()
+sessionInfo()
+```

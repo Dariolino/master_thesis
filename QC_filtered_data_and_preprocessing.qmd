@@ -1,0 +1,950 @@
+---
+title: "QC and Preprocessing with visually filtered data"
+author: "Dario DF"
+format: html
+editor: visual
+---
+
+## Summary
+
+This markdown contains the quality control and preprocessing step for the visually filtered Visium HD human embryonic data set. The code was adapted from <https://ludvigla.github.io/semla/articles/visiumHD.html>. In this file, the data objects are created that will be used for downstream analysis.
+
+## Load Library
+
+```{r}
+rm(list = ls())
+library(semla)
+library(stringr)
+library(tidyverse) 
+```
+
+## Set Directories
+
+```{r}
+# server paths
+input.dir <- "/srv/home/dario.dalofonseca/embryo_analysis_data/data/Visium_HD_embryo"
+input.dir_2 <- "/srv/home/dario.dalofonseca/embryo_analysis_data/R_objects"
+out.dir <- "/srv/home/dario.dalofonseca/embryo_analysis_data/R_objects"
+
+# add source functions for bin decomposition
+source("/home/dario.dalofonseca/projects/visium_analysis/scripts/get_hd_barcodes.R")
+```
+
+## Load Visium Data
+
+-   in this R object - the tiles that are to be included in the analysis had been selected using FeatureViewer
+
+```{r}
+# make data directory
+st.dir <- file.path(input.dir, "binned_outputs") 
+
+# directory for spatial data for hiresolution image
+img.dir <- file.path(input.dir, "spatial")
+
+# include resolutions 2, 8 and 16 µm
+res <- paste(0, c(2, 8, 16), "um", sep = "") #format: 02um 08um and 016um
+all.res <- paste(res, collapse = "|") #format:"02um|08um|016um"
+
+# get directories for all resolutions
+subdirs <- list.dirs(st.dir, recursive = FALSE)
+res.dir <- stringr::str_subset(subdirs, pattern = all.res)
+
+# define infoTable dataframe
+infoTable <- data.frame(
+  samples = list.files(res.dir,
+                       full.names = TRUE, recursive = TRUE,
+                       pattern = paste0("^filtered_feature.+.h5$")), # change to raw_feature if wanted
+  spotfiles = list.files(res.dir,
+                         full.names = TRUE, recursive = TRUE,
+                         pattern = "parquet$|positions.csv$"),
+  imgs = list.files(img.dir,
+                    recursive = TRUE,
+                    full.names = TRUE, pattern = "hires"
+                      ))
+# add json, resolution and sample_ID column
+infoTable <- infoTable |> mutate(json = list.files(st.dir,
+                                      recursive = TRUE,
+                                      full.names = TRUE, 
+                                      pattern = "^scalefactors") |> 
+                    str_subset(all.res),
+                    resolution = res,
+                    sample_ID = "humanembryo")
+  
+infoTable  
+```
+
+-   Read the Visium Data (here: all three resolutions: 2, 8, and 16 µm) & load images
+
+```{r}
+se.hd <- ReadVisiumData(infoTable) 
+se.hd <- LoadImages(se.hd)
+ImagePlot(se.hd, label_by = "resolution")
+```
+
+-   the embryonic sections were manually annotated using the FeatureViewer function in a separate script
+
+-   load the annotated Semla object (contains raw data matrix)
+
+-   get the annotation for the 4 sections
+
+```{r}
+# add the section column to the correct tile
+se_hd_annotated <- LoadSeuratRds(file.path(input.dir_2, "se_hd_with_section_annotations.rds"))
+se.hd[[]]$section <- se_hd_annotated$section[rownames(se.hd[[]])]
+```
+
+-   subset into resolution 16 µm
+
+```{r}
+se.hd_res16 <- SubsetSTData(se.hd, resolution == "016um")
+```
+
+-   add information on manually annotated tiles for resolution 16 µm and update it
+
+```{r}
+# add the identity column (also used for filtering)
+se_hd_identity <- LoadSeuratRds(file.path(input.dir_2,
+                                          "se_hd_res16_section_A_B_C_D_annotated.rds"))
+se.hd_res16[[]]$identity <- se_hd_identity$identity[rownames(se.hd_res16[[]])]
+
+# add tissue column that does not specify the embryo section with the identity name
+se.hd_res16[[]]$tissue <- substr(se.hd_res16[[]]$identity, 1, nchar(se.hd_res16[[]]$identity) - 2)
+
+# update resolution 16 µm object
+keep.tiles_res16 <- se.hd_res16[[]] |> 
+  filter(!is.na(tissue)) |> 
+  rownames()
+
+se.hd_res16 <- SubsetSTData(se.hd_res16, spots = keep.tiles_res16)
+se.hd_res16[[]]
+```
+
+-   inspect section annotation for res 16
+
+```{r}
+MapLabels(se.hd_res16, shape = "tile", column_name = "tissue", image_use = "raw")
+```
+
+## Preparing the objects for resolution 2 and 8 µm
+
+Note: we want the higher resolution objects to capture the same area as the 16 µm resolution object. We therefore need to decompose the grid (area) of the 16 µm object. However, the filtered feature matrix for the higher resolution already has filtered out spots by default that would occur during decomposing, which is why we need to reload the visium data with the raw feature matrix. We then could filter this object to have the decomposed spots, as well as the same features as the 16 µm object.
+
+```{r}
+# make data directory (dirname to move one folder layer out)
+st.dir <- file.path(input.dir, "binned_outputs") 
+
+# directory for spatial data for hiresolution image
+img.dir <- file.path(input.dir, "spatial")
+
+# include resolutions 2, 8 and 16 µm
+res <- paste(0, c(2, 8, 16), "um", sep = "") #format: 02um 08um and 016um
+all.res <- paste(res, collapse = "|") #format:"02um|08um|016um"
+
+# get directories for all resolutions
+subdirs <- list.dirs(st.dir, recursive = FALSE)
+res.dir <- stringr::str_subset(subdirs, pattern = all.res)
+
+# define infoTable dataframe
+infoTable <- data.frame(
+  samples = list.files(res.dir,
+                       full.names = TRUE, recursive = TRUE,
+                       pattern = paste0("^raw_feature.+.h5$")), # !!!!!
+  spotfiles = list.files(res.dir,
+                         full.names = TRUE, recursive = TRUE,
+                         pattern = "parquet$|positions.csv$"),
+  imgs = list.files(img.dir,
+                    recursive = TRUE,
+                    full.names = TRUE, pattern = "hires"
+                      ))
+# add json, resolution and sample_ID column
+infoTable <- infoTable |> mutate(json = list.files(st.dir,
+                                      recursive = TRUE,
+                                      full.names = TRUE, 
+                                      pattern = "^scalefactors") |> 
+                    str_subset(all.res),
+                    resolution = res,
+                    sample_ID = "humanembryo")
+  
+infoTable  
+```
+
+```{r}
+se.hd_raw <- ReadVisiumData(infoTable, remove_spots_outside_tissue = FALSE) 
+se.hd_raw <- LoadImages(se.hd_raw)
+ImagePlot(se.hd_raw, label_by = "resolution")
+```
+
+-   subset into the resolutions 2 and 8 µm
+
+-   define tiles to keep based on decomposition of res 16
+
+```{r}
+keep.tiles_res2 <- decompose_grid(keep.tiles_res16, from = 16, to = 2,
+                                  coordinates = GetCoordinates(se_hd_identity))
+keep.tiles_res2 <- paste0(keep.tiles_res2, "-1")
+
+keep.tiles_res8 <- decompose_grid(keep.tiles_res16, from = 16, to = 8,
+                                  coordinates = GetCoordinates(se_hd_identity))
+keep.tiles_res8 <- paste0(keep.tiles_res8, "-2") # for filtered barcodes it would be -1
+```
+
+-   define genes to keep based on the filtered object
+
+```{r}
+# is equal to the row sums of our expression matrix
+nCount.UMI <- Matrix::rowSums(LayerData(se.hd, assay = "Spatial", layer = "counts"))
+nObs.genes <- Matrix::rowSums(LayerData(se.hd) > 0)
+
+# construct new data frame with the information extracted above
+gene.data <- data.frame(nCounts = nCount.UMI, nObs = nObs.genes)
+
+keep.genes <- rownames(gene.data)
+```
+
+```{r}
+se.hd_res2 <- SubsetSTData(se.hd_raw, spots = keep.tiles_res2, features = keep.genes)
+se.hd_res8 <- SubsetSTData(se.hd_raw, spots = keep.tiles_res8, features = keep.genes)
+```
+
+```{r}
+se.hd_res2[[]] # 543 of the decomposed barcodes are missing --> negligible
+se.hd_res8[[]] # spot number corresponds to expected amount 
+```
+
+```{r}
+setdiff(keep.tiles_res2, rownames(se.hd_raw[[]])) |> 
+  length()
+```
+
+-   0.05% spots missing that should be there based on decomposing for res 2 –\> negligible
+
+```{r, fig.asp = 1}
+MapFeatures(se.hd_res2, shape = "point", pt_size = 0.1, features = "nFeature_Spatial", image_use = "raw", colors = viridis::turbo(11))
+
+MapFeatures(se.hd_res2, shape = "tile", features = "nFeature_Spatial", colors = viridis::turbo(11))
+```
+
+### Next step: Reformatting the higher resolutions so that we have the same metadata annotations
+
+-   update the objects of higher resolution to have the correct metadata
+
+```{r}
+adjust_decomposed_seurat_obj <- function(decomposed_se_obj, decomposed_resolution, se_obj_res16) {
+  # calculate decomposing factor
+  if (decomposed_resolution == 2) {
+    decomposing_factor = 64 # each 16 µm tile creates 64 2 µm tiles
+  } else if (decomposed_resolution == 8) {
+    decomposing_factor = 4 # each 16 µm tile creates 4 8 µm tiles
+  }
+  
+  # get identity and tissue annotation from res16 obj metadata
+  metadata_res16 <- se_obj_res16[[]] |> 
+    filter(!is.na(tissue)) |> 
+    dplyr::select(section, identity, tissue) |> 
+    rownames_to_column(var = "barcode_res16") # have the barcode has its own column
+  
+  # generate mapping dataframe so one knows to which lower resolution tile the decompsoed tiles belong to 
+  tiles_mapping_high_res <- decompose_grid(metadata_res16$barcode_res16, from = 16,
+                                          to = decomposed_resolution,
+                                     coordinates = GetCoordinates(se_obj_res16)) 
+  tiles_mapping_high_res <- data.frame(barcode_res16 = rep(metadata_res16$barcode_res16,
+                                                           each = decomposing_factor),  
+  barcode_high_res = tiles_mapping_high_res)
+  
+  # update barcodes for lower resolutions to match to the decomposed ones 
+  tiles_mapping_high_res$barcode_high_res <- paste0(tiles_mapping_high_res$barcode_high_res,
+                                                    "-1") 
+  
+  # merge metadata from lower res into decomposed barcodes
+  metadata_high_res <- tiles_mapping_high_res |> 
+    left_join(metadata_res16, by = "barcode_res16") |> 
+    dplyr::select(barcode_high_res, section, identity, tissue)
+  
+  # subset higher resoltion object and assign metadata
+  se.hd_high_res <- SubsetSTData(decomposed_se_obj, spots = metadata_high_res$barcode_high_res)
+  
+  # rownames to column before merging metadata and add section, tissue and identity info
+  metadata_high_res_df <- se.hd_high_res[[]] |> 
+    rownames_to_column(var = "barcode_high_res") |> 
+    left_join(metadata_high_res, by = "barcode_high_res")
+  
+  # convert back to Seurat metadata format and assign updated metadata back
+  rownames(metadata_high_res_df) <- metadata_high_res_df$barcode_high_res
+  metadata_high_res_df <- metadata_high_res_df |> dplyr::select(-barcode_high_res)  # remove extra column
+  se.hd_high_res[[]] <- metadata_high_res_df
+
+  # sanity check
+  print(se.hd_high_res[[]])
+
+  return(se.hd_high_res)
+}
+```
+
+```{r}
+se.hd_res2 <- adjust_decomposed_seurat_obj(decomposed_se_obj = se.hd_res2,
+                                           decomposed_resolution = 2,
+                                           se_obj_res16 = se.hd_res16)
+
+se.hd_res8 <- adjust_decomposed_seurat_obj(decomposed_se_obj = se.hd_res8,
+                                           decomposed_resolution = 8,
+                                           se_obj_res16 = se.hd_res16)
+```
+
+```{r}
+print("Number of tiles/bins belonging to a tissue section:")
+print("Resolution 2: ")
+table(se.hd_res2[[]]$section)
+print("Resolution 8: ")
+table(se.hd_res8[[]]$section)
+print("Resolution 16: ")
+table(se.hd_res16[[]]$section)
+```
+
+```{r, fig.height = 5, fig.width = 5}
+MapLabels(se.hd_res2, shape = "tile", column_name = "section", image_use = "raw")
+MapLabels(se.hd_res8, shape = "tile", column_name = "section", image_use = "raw")
+MapLabels(se.hd_res16, shape = "tile", column_name = "tissue", image_use = "raw",
+          crop_area = c(0.03, 0.07, 0.87, 0.83))
+```
+
+## Quality control and potential secondary filtering
+
+### Spatial plots
+
+-   counts
+
+```{r, fig.height = 10, fig.width = 10}
+s1_counts <- MapFeatures(se.hd_res2, shape = "tile", features = "nCount_Spatial",
+                         colors = viridis::turbo(11), image_use = "raw")
+s2_counts <- MapFeatures(se.hd_res8, shape = "tile", features = "nCount_Spatial",
+                         colors = viridis::turbo(11), image_use = "raw")
+s3_counts <- MapFeatures(se.hd_res16, , shape = "tile", features = "nCount_Spatial",
+                         colors = viridis::turbo(11), image_use = "raw")
+
+s1_counts
+s2_counts
+s3_counts
+```
+
+-   features
+
+```{r, fig.height = 5, fig.width = 5}
+s1_genes <- MapFeatures(se.hd_res2, features = "nFeature_Spatial", shape = "tile",
+                        colors = viridis::turbo(11), image_use = "raw", max_cutoff = 0.999)
+s2_genes <- MapFeatures(se.hd_res8, features = "nFeature_Spatial", shape = "tile",
+                        colors = viridis::turbo(11), max_cutoff = 0.99, image_use = "raw", crop_area = c(0.03, 0.07, 0.87, 0.83)) # image_use = "raw"
+s3_genes <- MapFeatures(se.hd_res16, features = "nFeature_Spatial", shape = "tile",
+                        colors = viridis::turbo(11), max_cutoff = 0.999, image_use = "raw")
+
+s1_genes
+s2_genes
+s3_genes
+```
+
+### UMI and gene histograms and filtering considerations
+
+-   auxiliarry functions
+
+```{r}
+# plot UMI histogram, optionally with log10 transformed data
+plot_UMI_histogram <- function(semla_obj, fill = "red", bins = 60, title_addition = "",
+                               use_log = FALSE, x_intercept = 0) {
+    if (use_log) {
+      x_label = "Number of transcripts (log10) per tile"
+      data <- log10(semla_obj[[]]$nCount_Spatial + 1) # log transformation
+    } else {
+      x_label = "Number of transcripts per tile"
+      data <- semla_obj[[]]$nCount_Spatial # raw values
+    }
+    
+    ggplot(data = data.frame(x = data), aes(x = x)) +
+    geom_histogram(fill = fill, alpha = 0.7, bins = bins) +
+    geom_vline(xintercept = x_intercept, color = "black", linetype = "dashed") +
+    labs(x = x_label,
+         y = "Frequency",
+         title = paste0("Histogram | Total counts (UMIs)", title_addition)) +
+      xlim(0, NA) +
+      theme_bw()
+}
+
+# plot gene number histogram, optionally with log10 transformed data
+plot_gene_histogram <- function(semla_obj, fill = "blue", bins = 60, title_addition = "",
+                                use_log = FALSE, x_intercept = 0) {
+    if (use_log) {
+      x_label = "Number of genes (log10) per tile"
+      data <- log10(semla_obj[[]]$nFeature_Spatial + 1) # log transformation
+    } else {
+      x_label = "Number of genes per tile"
+      data <- semla_obj[[]]$nFeature_Spatial # raw values
+    }
+  
+    ggplot(data = data.frame(x = data), aes(x = x)) +
+    geom_histogram(fill = fill, alpha = 0.7, bins = bins) +
+    geom_vline(xintercept = x_intercept, color = "black", linetype = "dashed") +
+    labs(x = x_label,
+         y = "Frequency",
+         title = paste0("Histogram | Genes", title_addition)) +
+      xlim(0, NA) +
+      theme_bw()
+}
+
+# plot UMI or gene histogram separately for the four embryonic sections
+plot_histograms_for_sections <- function(semla_obj, metadata = "nCount_Spatial",
+                                                 binwidth = 300, title = "") {
+  data <- semla_obj[[]] %>% 
+                      filter(section %in% c("A","B", "C", "D")) # drop NAs outside capture area
+  
+  if (metadata == "nCount_Spatial") {
+    x_label = "Number of transcripts per tile"
+  } else if (metadata == "nFeature_Spatial") {
+    x_label = "Number of genes per tile"
+  }
+  # histogram for total counts
+  ggplot(data, aes(x = .data[[metadata]], fill = section)) +
+  geom_histogram(binwidth = binwidth, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("A" = "#F45E5A", "B" = "#3E833D",
+                                 "C" = "#18B3B7", "D" = "#B85EFF")) +
+  labs(title = title,
+         x = x_label, y = "Frequency") +
+         facet_wrap(~ section) +
+        theme_bw()
+}
+```
+
+-   UMI and gene histograms at different resolutions for all tissue sections together
+
+```{r, fig.width = 14}
+h2_UMI <- plot_UMI_histogram(se.hd_res2, title_addition = " | Resolution 2", use_log = TRUE, x_intercept = NULL)
+h8_UMI <- plot_UMI_histogram(se.hd_res8, title_addition = " | Resolution 8", use_log = TRUE, x_intercept = NULL)
+h16_UMI <- plot_UMI_histogram(se.hd_res16, title_addition = " | Resolution 16", use_log = TRUE,
+                              x_intercept = log10(100))
+h2_genes <- plot_gene_histogram(se.hd_res2, title_addition = " | Resolution 2", use_log = TRUE, x_intercept = NULL)
+h8_genes <- plot_gene_histogram(se.hd_res8, title_addition = " | Resolution 8", use_log = TRUE, x_intercept = NULL)
+h16_genes <- plot_gene_histogram(se.hd_res16, title_addition = " | Resolution 16",
+                                 use_log = TRUE, x_intercept = log10(75))
+
+(h2_UMI / h2_genes) | (h8_UMI / h8_genes) | (h16_UMI / h16_genes)
+```
+
+-   visual cleaning of the image reduced zero-inflation (compare with file QC_raw_data.qmd)
+
+-   potential additional filtering at resolution 16 µm (UMI \> 100, genes \>75) could remove additional noise
+
+### Mitochondrial Content
+
+-   merge data set for future plots
+
+```{r}
+se.hd <- MergeSTData(se.hd_res2, list(se.hd_res8, se.hd_res16))
+se.hd[[]]$resolution <- gsub("^016um", "16um", se.hd[[]]$resolution)
+se.hd <- LoadImages(se.hd)
+```
+
+```{r, fig.asp = 0.6173}
+se.hd[["percent.mt"]] <- data.frame(PercentageFeatureSet(se.hd, pattern = "^MT-"))
+se.hd_res2[["percent.mt"]] <- data.frame(PercentageFeatureSet(se.hd_res2, pattern = "^MT-"))
+se.hd_res8[["percent.mt"]] <- data.frame(PercentageFeatureSet(se.hd_res8, pattern = "^MT-"))
+se.hd_res16[["percent.mt"]] <- data.frame(PercentageFeatureSet(se.hd_res16, pattern = "^MT-"))
+
+ggplot(se.hd[[]], aes(resolution, percent.mt, fill = resolution)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+  labs(title = "Mitochondrial content for each resolution") + 
+  theme_bw()
+# VlnPlot(se.hd_res16, features = "percent.mt", ncol = 1)
+```
+
+-   potential percent.mt cutoff of 20 for resolution 16 µm
+
+```{r, fig.height=12, fig.width =12}
+MapFeatures(se.hd_res2, shape = "tile", features = "percent.mt", colors = viridis::turbo(11), image_use = "raw")
+MapFeatures(se.hd_res8, shape = "tile", features = "percent.mt", colors = viridis::turbo(11), image_use =  "raw")
+MapFeatures(se.hd_res16, shape = "tile", features = "percent.mt", colors = viridis::turbo(11), image_use = "raw")
+```
+
+### Inspecting the influence of filtering
+
+-   note: we will later plot the spots that are filtered out (rev_threshold)
+
+```{r}
+# filters tiles and plots retained or removed tiles spatially
+filter_tiles_and_make_spatial_map <- function(semla_obj, UMI_cutoff = 0, gene_cutoff = 0,
+                                              mt_cutoff = 100, rev_threshold = FALSE) {
+  
+  original_spots <- rownames(semla_obj[[]])
+  
+  keep.spots <- semla_obj[[]] %>% 
+    filter(nCount_Spatial >= UMI_cutoff, nFeature_Spatial >= gene_cutoff,
+           percent.mt <= mt_cutoff) %>% 
+    rownames()
+  
+  if (rev_threshold == "mt") {
+    keep.spots <- semla_obj[[]] %>% 
+      filter(nCount_Spatial >= UMI_cutoff, nFeature_Spatial >= gene_cutoff,
+             percent.mt > mt_cutoff) %>% 
+      rownames()
+  } else if (rev_threshold == "UMI") {
+    keep.spots <- semla_obj[[]] %>% 
+      filter(nCount_Spatial < UMI_cutoff, nFeature_Spatial >= gene_cutoff,
+             percent.mt <= mt_cutoff) %>% 
+      rownames()
+  } else if (rev_threshold == "gene") {
+    keep.spots <- semla_obj[[]] %>% 
+      filter(nCount_Spatial >= UMI_cutoff, nFeature_Spatial< gene_cutoff,
+             percent.mt <= mt_cutoff) %>% 
+      rownames()
+  } else if (rev_threshold == "UMI+gene") {
+    keep.spots <- semla_obj[[]] %>% 
+      filter(nCount_Spatial < UMI_cutoff | nFeature_Spatial< gene_cutoff,
+             percent.mt <= mt_cutoff) %>% 
+      rownames()
+  } else if (rev_threshold == "UMI+gene+mt") {
+    keep.spots <- semla_obj[[]] %>% 
+      filter(nCount_Spatial < UMI_cutoff | nFeature_Spatial< gene_cutoff | percent.mt > mt_cutoff) %>% 
+      rownames()
+  }
+  
+  print(paste0(length(keep.spots), " out of ", length(original_spots),
+               " (", round(100*length(keep.spots)/length(original_spots), 2),
+               "%) tiles were retained. The ratio between kept and removed tiles is: ",
+               round(length(keep.spots)/(length(original_spots)-length(keep.spots)), 4)))
+  
+  filtered_semla_obj <- SubsetSTData(semla_obj, spots = keep.spots)
+  
+  spatial_counts <- MapFeatures(filtered_semla_obj, features = "nCount_Spatial",
+                                colors = viridis::turbo(11), image_use = "raw", shape = "tile", crop_area = c(0.03, 0.07, 0.87, 0.83))
+  spatial_genes <- MapFeatures(filtered_semla_obj, features = "nFeature_Spatial",
+                               colors = viridis::turbo(11), image_use = "raw", shape = "tile", crop_area = c(0.03, 0.07, 0.87, 0.83)) 
+  spatial_mt <- MapFeatures(filtered_semla_obj, features = "percent.mt", image_use = "raw",
+                               colors = viridis::turbo(11), shape = "tile", crop_area = c(0.03, 0.07, 0.87, 0.83))
+  
+  spatial_counts | spatial_genes | spatial_mt
+}
+```
+
+-   mt filtering considerations
+
+```{r, fig.height = 10, fig.width = 10}
+filter_tiles_and_make_spatial_map(se.hd_res2, mt_cutoff = 99, rev_threshold = "mt")
+filter_tiles_and_make_spatial_map(se.hd_res8, mt_cutoff = 40, rev_threshold = "mt")
+filter_tiles_and_make_spatial_map(se.hd_res16, mt_cutoff = 20, rev_threshold = "mt")
+```
+
+-   UMI filtering considerations
+
+```{r, fig.height = 15, fig.width = 15}
+filter_tiles_and_make_spatial_map(se.hd_res16, UMI_cutoff = 50, rev_threshold = "UMI")
+filter_tiles_and_make_spatial_map(se.hd_res16, UMI_cutoff = 100, rev_threshold = "UMI")
+filter_tiles_and_make_spatial_map(se.hd_res16, UMI_cutoff = 150, rev_threshold = "UMI")
+```
+
+-   gene filtering considerations
+
+```{r, fig.height = 15, fig.width = 15}
+filter_tiles_and_make_spatial_map(se.hd_res16, gene_cutoff = 40, rev_threshold = "gene")
+filter_tiles_and_make_spatial_map(se.hd_res16, gene_cutoff = 100, rev_threshold = "gene")
+filter_tiles_and_make_spatial_map(se.hd_res16, gene_cutoff = 150, rev_threshold = "gene")
+```
+
+-   joint UMI and gene filtering considerations
+
+```{r}
+filter_tiles_and_make_spatial_map(se.hd_res16, UMI_cutoff = 100, gene_cutoff = 75, rev_threshold = "UMI+gene")
+filter_tiles_and_make_spatial_map(se.hd_res16, UMI_cutoff = 100, gene_cutoff = 50, rev_threshold = "UMI+gene")
+filter_tiles_and_make_spatial_map(se.hd_res16, UMI_cutoff = 100, gene_cutoff = 40, rev_threshold = "UMI+gene")
+filter_tiles_and_make_spatial_map(se.hd_res16, UMI_cutoff = 100, gene_cutoff = 30, rev_threshold = "UMI+gene")
+```
+
+-   gene cutoff is redundant when using the UMI cutoff of 100, up until gene cutoff of 75 (here: 1 additional spot is excluded thanks to the gene cutoff)
+
+-   all additional filtering cutoffs together
+
+-   final additional filtering:
+
+    ```{r}
+    # updated function for blue or green coloring based on filtering
+    filter_tiles_and_make_spatial_map <- function(semla_obj, UMI_cutoff = 0, gene_cutoff = 0,
+                                                  mt_cutoff = 100, rev_threshold = FALSE) {
+      
+      df <- semla_obj[[]]
+      original_spots <- rownames(df)
+      
+      # Default: keep spots by threshold
+      condition <- df$nCount_Spatial >= UMI_cutoff & 
+                   df$nFeature_Spatial >= gene_cutoff & 
+                   df$percent.mt <= mt_cutoff
+
+      # Reverse threshold logic
+      if (rev_threshold == "mt") {
+        condition <- df$percent.mt > mt_cutoff & 
+                     df$nCount_Spatial >= UMI_cutoff & 
+                     df$nFeature_Spatial >= gene_cutoff
+      } else if (rev_threshold == "UMI") {
+        condition <- df$nCount_Spatial < UMI_cutoff & 
+                     df$nFeature_Spatial >= gene_cutoff & 
+                     df$percent.mt <= mt_cutoff
+      } else if (rev_threshold == "gene") {
+        condition <- df$nFeature_Spatial < gene_cutoff & 
+                     df$nCount_Spatial >= UMI_cutoff & 
+                     df$percent.mt <= mt_cutoff
+      } else if (rev_threshold == "UMI+gene") {
+        condition <- (df$nCount_Spatial < UMI_cutoff | df$nFeature_Spatial < gene_cutoff) & 
+                     df$percent.mt <= mt_cutoff
+      } else if (rev_threshold == "UMI+gene+mt") {
+        condition <- df$nCount_Spatial < UMI_cutoff | 
+                     df$nFeature_Spatial < gene_cutoff | 
+                     df$percent.mt > mt_cutoff
+      }
+      
+      # Create numeric indicator: 1 = kept, 0 = removed
+      df$keep_status_numeric <- ifelse(condition, 1, 0)
+      semla_obj <- AddMetaData(semla_obj, metadata = df$keep_status_numeric, col.name = "keep_status_numeric")
+
+      # Print summary
+      print(paste0(sum(df$keep_status_numeric == 1), " out of ", length(original_spots),
+                   " (", round(100 * mean(df$keep_status_numeric == 1), 2),
+                   "%) tiles were retained. The ratio between kept and removed tiles is: ",
+                   round(sum(df$keep_status_numeric == 1) / sum(df$keep_status_numeric == 0), 4)))
+
+      # Map the keep_status_numeric: 1 = green (kept), 0 = black (removed)
+      MapFeatures(semla_obj, features = "keep_status_numeric",
+                  colors = c("darkblue", "green"),  # 0 = black, 1 = green
+                  image_use = "raw", shape = "tile", crop_area = c(0.03, 0.07, 0.87, 0.83))
+    }
+
+    ```
+
+```{r, fig.height = 12, fig.width = 12 }
+filter_tiles_and_make_spatial_map(se.hd_res16, UMI_cutoff = 100, rev_threshold = "UMI")
+filter_tiles_and_make_spatial_map(se.hd_res16, gene_cutoff = 75, rev_threshold = "gene")
+filter_tiles_and_make_spatial_map(se.hd_res16, mt_cutoff = 20, rev_threshold = "mt")
+```
+
+```{r, fig.height = 12, fig.width = 12 }
+filter_tiles_and_make_spatial_map(se.hd_res16, UMI_cutoff = 100, gene_cutoff = 75, mt_cutoff = 20, rev_threshold = "UMI+gene+mt")
+```
+
+#### Comparing spots across tissue sections
+
+```{r}
+# for correct order in resolutions
+se.hd[[]]$resolution <- factor(se.hd[[]]$resolution, levels = c("02um", "08um", "16um"))
+
+# normal scale - counts
+ggplot(se.hd[[]],aes(resolution, nCount_Spatial, fill = resolution)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 4) +
+  labs(title = "Total counts for each resolution") +
+  theme_bw()
+
+# log scale - counts
+ggplot(se.hd[[]], aes(resolution, log10(nCount_Spatial), fill = resolution)) +
+  geom_boxplot() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 4) +
+  labs(title = "Logged counts for each resolution") +
+  theme_bw()
+
+# normal scale - genes
+ggplot(se.hd[[]], aes(resolution, nFeature_Spatial, fill = resolution)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 4) +
+  labs(title = "Total number of genes for each resolution") +
+  theme_bw()
+
+# log scale - genes
+ggplot(se.hd[[]], aes(resolution, log10(nFeature_Spatial), fill = resolution)) +
+  geom_boxplot() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 4) +
+  labs(title = "Logged number of genes for each resolution") +
+  theme_bw()
+```
+
+-   UMI & gene distributions for all resolutions (all sections separately)
+
+```{r}
+# normal scale - counts
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, nCount_Spatial, fill = section)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+  labs(title = "Total counts for each resolution and tissue section") +
+  theme_bw()
+
+# log scale - counts
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, log(nCount_Spatial), fill = section)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+    labs(title = "Logged counts for each resolution and tissue section") +
+  theme_bw()
+
+# normal scale - genes
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, nFeature_Spatial, fill = section)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+  labs(title = "Total number of genes for each resolution and tissue section") +
+  theme_bw()
+
+# log scale - genes
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, log(nFeature_Spatial), fill = section)) +
+  geom_boxplot() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+    labs(title = "Logged number of genes for each resolution and tissue section") +
+  theme_bw()
+
+## new - normal scale - mitochondrial content
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, percent.mt, fill = section)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+  labs(title = "Mitochondrial content for each resolution and tissue section") +
+  theme_bw()
+```
+
+-   UMI & gene distributions for all resolutions (all tissue types separately)
+
+```{r}
+# normal scale - counts
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, nCount_Spatial, fill = tissue)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+  labs(title = "Total counts for each resolution and tissue type") +
+  theme_bw()
+
+# log scale - counts
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, log(nCount_Spatial), fill = tissue)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+    labs(title = "Logged counts for each resolution and tissue type") +
+  theme_bw()
+
+# normal scale - genes
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, nFeature_Spatial, fill = tissue)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+  labs(title = "Total number of genes for each resolution and tissue type") +
+  theme_bw()
+
+# log scale - genes
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, log(nFeature_Spatial), fill = tissue)) +
+  geom_boxplot() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+    labs(title = "Logged number of genes for each resolution and tissue type") +
+  theme_bw()
+
+## new - normal - mitochondrial content
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, percent.mt, fill = tissue)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+  labs(title = "Mitochondrial content for each resolution and tissue type") +
+  theme_bw()
+```
+
+-   UMI & gene distributions for all resolutions (all tissue identities separately)
+
+```{r, fig.width = 8}
+# normal scale - counts
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, nCount_Spatial, fill = identity)) +
+  geom_boxplot() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+  labs(title = "Total counts for each resolution and tissue identity") +
+  theme_bw()
+
+# log scale - counts
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, log(nCount_Spatial), fill = identity)) +
+  geom_violin() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+    labs(title = "Logged counts for each resolution and tissue identity") +
+  theme_bw()
+
+# normal scale - genes
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, nFeature_Spatial, fill = identity)) +
+  geom_boxplot() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+  labs(title = "Total number of genes for each resolution and tissue identity") +
+  theme_bw()
+
+# log scale - genes
+ggplot(se.hd[[]] %>% filter(section %in% c("A","B", "C", "D")),
+       aes(resolution, log(nFeature_Spatial), fill = identity)) +
+  geom_boxplot() +
+  facet_wrap(vars(resolution), scales = "free", ncol = 3) +
+    labs(title = "Logged number of genes for each resolution and tissue identity") +
+  theme_bw()
+```
+
+## Initial Exploratory Clustering with resolution 16 µm
+
+-   here, we will analyze the influence of using SCTransform compared to the traditional NormalizeData–\>ScaleData–\>FindVariableFeatures pipeline, as well as the influence of additional UMI-gene-mt.content-based filtering on the UMAP. For those scenarios, we will sweep over different resolution to get a better overview.
+
+-   a comprehensive clustering optimization is found in the file clustering.qmd
+
+-   function to sweep over resolutions to assess influence of clustering resolution
+
+```{r}
+resolutions <- c(0.1, 0.2, 0.3, 0.4, 0.5, 1.0)
+
+resolution_sweep <- function(se_obj, vector_with_resolutions) {
+  
+  for (res in vector_with_resolutions) {
+    # clustering
+    se_obj_cl <- FindClusters(se_obj, resolution = res)
+    
+    # PCA
+    pca_plot <- DimPlot(se_obj_cl, reduction = "pca", group.by = "seurat_clusters") +
+    ggtitle(paste("PCA Plot | Resolution =", res))
+    
+    # UMAP
+    umap_plot <- DimPlot(se_obj_cl, reduction = "umap", group.by = "seurat_clusters") +
+    ggtitle(paste("UMAP Plot | Resolution =", res))
+    
+    # Spatial Map
+    spatial_plot <- MapLabels(se_obj_cl, column_name = "seurat_clusters", shape = "tile", 
+                              pt_alpha = 0.7, image_use = "raw", 
+                colors = viridis::turbo(n = length(unique(se_obj_cl$seurat_clusters)))) +
+    guides(fill = guide_legend(override.aes = list(size = 5))) +
+    ggtitle(paste("Spatial Clusters | Resolution =", res))
+    
+    print(pca_plot)
+    print(umap_plot)
+    print(spatial_plot)
+  }
+}
+```
+
+### 1) No additional filtering and with traditional seurat normalization
+
+```{r}
+se.hd_res16_log <- se.hd_res16 |>
+  NormalizeData() |> # log normalization
+  ScaleData() |>
+  FindVariableFeatures(nfeatures = 3000) |> 
+  RunPCA() |> #ElbowPlot() 
+  FindNeighbors(reduction = "pca", dims = 1:10) |>
+  FindClusters(resolution = 0.2) |> 
+  RunUMAP(reduction = "pca", dims = 1:10) 
+```
+
+```{r, fig.asp=1}
+resolution_sweep(se.hd_res16_log, resolutions) # resolution 0.4 is good
+```
+
+### 2) No additional filtering and with SCTransform
+
+```{r}
+se.hd_res16_sct <- se.hd_res16 |>
+  SCTransform(assay = "Spatial") |> 
+  RunPCA() |>
+  FindNeighbors(reduction = "pca", dims = 1:10) |>
+  FindClusters(resolution = 0.2) |> 
+  RunUMAP(reduction = "pca", dims = 1:10)
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res16_sct, resolutions) # 0.3 is nice
+```
+
+### 3) With additional filtering & traditional seurat normalization
+
+```{r}
+keep.spots_filt <- se.hd_res16[[]] %>% 
+  filter(nCount_Spatial >= 100, nFeature_Spatial >= 75, percent.mt <= 20) %>% 
+  rownames()
+
+se.hd_res16_filt <- SubsetSTData(se.hd_res16, spots = keep.spots_filt)
+```
+
+```{r}
+se.hd_res16_filt_log <- se.hd_res16_filt |>
+  NormalizeData() |>
+  ScaleData() |>
+  FindVariableFeatures(nfeatures = 3000) |>
+  RunPCA() |>
+  FindNeighbors(reduction = "pca", dims = 1:10) |>
+  FindClusters(resolution = 0.2) |> 
+  RunUMAP(reduction = "pca", dims = 1:10) 
+```
+
+```{r, fig.asp=1}
+resolution_sweep(se.hd_res16_filt_log, resolutions) # maybe res 0.4 or 0.5
+```
+
+### 4) With additional filtering - and SCTransform
+
+```{r}
+se.hd_res16_filt_sct <- se.hd_res16_filt |>
+  SCTransform(assay = "Spatial") |> 
+  RunPCA() |>
+  FindNeighbors(reduction = "pca", dims = 1:10) |>
+  FindClusters(resolution = 0.2) |> 
+  RunUMAP(reduction = "pca", dims = 1:10) 
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res16_filt_sct, resolutions) # does not distinguish between neural tube and somites
+```
+
+-   conclusion: additional filtering may marginally lead to better separation of the clusters?
+
+-   LogNormalization and SCTtransform are very similar
+
+-   trying out other resolution and also deep clustering for the main body could be beneficial
+
+## Preparing objects for clustering 2 and 8 µm
+
+-   here: save R objects for the resolutions with and without additional filtering - clustering is performed in a separate script
+
+-   first, make decomposed filtered seurat objects:
+
+```{r}
+se.hd_res8_filt <- adjust_decomposed_seurat_obj(se.hd_res8, 8, se.hd_res16_filt)
+
+# remove duplicate columns (they end in .x or .y)
+duplicated_cols <- grep("\\.(x|y)$", colnames(se.hd_res8_filt@meta.data), value = TRUE)
+print(duplicated_cols)
+se.hd_res8_filt@meta.data <- se.hd_res8_filt@meta.data[, !colnames(se.hd_res8_filt@meta.data) %in% duplicated_cols]
+
+se.hd_res2_filt <- adjust_decomposed_seurat_obj(se.hd_res2, 2, se.hd_res16_filt)
+
+# remove duplicate columns (they end in .x or .y)
+duplicated_cols <- grep("\\.(x|y)$", colnames(se.hd_res2_filt@meta.data), value = TRUE)
+print(duplicated_cols)
+se.hd_res2_filt@meta.data <- se.hd_res2_filt@meta.data[, !colnames(se.hd_res2_filt@meta.data) %in% duplicated_cols]
+```
+
+```{r}
+se.hd_res16[[]]
+se.hd_res16_filt[[]]
+se.hd_res8_filt[[]]
+se.hd_res2_filt[[]] # 136 spots missing -> negligible
+```
+
+-   save seurat objects for all resolutions - without and with the additional filtering
+
+```{r}
+saveRDS(se.hd_res16, file = file.path(out.dir, "se.hd_res16.rds"))
+saveRDS(se.hd_res16_filt, file = file.path(out.dir, "se.hd_res16_filt.rds"))
+
+saveRDS(se.hd_res8, file = file.path(out.dir, "se.hd_res8.rds"))
+saveRDS(se.hd_res8_filt, file = file.path(out.dir, "se.hd_res8_filt.rds"))
+
+saveRDS(se.hd_res2, file = file.path(out.dir, "se.hd_res2.rds"))
+saveRDS(se.hd_res2_filt, file = file.path(out.dir, "se.hd_res2_filt.rds"))
+```
+
+## Session Info
+
+```{r}
+date()
+sessionInfo()
+```

@@ -1,0 +1,827 @@
+---
+title: "Clustering Optimization"
+author: "Dario DF"
+format: html
+editor: visual
+---
+
+## Summary
+
+This markdown contains the clustering step for the Visium HD human embryo dataset. The code was adapted from <https://ludvigla.github.io/semla/articles/visiumHD.html>.
+
+## Load Libraries
+
+```{r}
+rm(list = ls())
+library(semla)
+library(stringr)
+library(tidyverse) 
+```
+
+## Set Directories
+
+```{r}
+# server paths
+input.dir <- "/srv/home/dario.dalofonseca/embryo_analysis_data/R_objects"
+
+# add source functions for bin decomposition
+source("/home/dario.dalofonseca/projects/visium_analysis/scripts/get_hd_barcodes.R")
+```
+
+## Auxiliary functions
+
+```{r}
+# function to apply data pre-processing to seurat object from normalization to dimensionality reduction
+prepare_seurat_obj <- function(se_obj, mode, include_normalization = TRUE, PCA_dims = 10,
+                               cluster_resolution = 0.2, vars.to.regress = NULL) {
+  
+  # either use log normalization or sct normalization
+  if (include_normalization) {
+    if (mode == "log") {
+     se_obj <- se_obj |> 
+       NormalizeData() |> 
+       ScaleData() |>  
+       FindVariableFeatures(nfeatures = 3000)
+    
+    } else if (mode == "sct") {
+      se_obj <- se_obj |> 
+       SCTransform(assay = "Spatial", vars.to.regress = vars.to.regress)
+   }
+  }
+  
+  se_obj <- se_obj |> 
+    RunPCA() |> 
+    FindNeighbors(reduction = "pca", dims = 1:PCA_dims) |>
+    FindClusters(resolution = cluster_resolution) |>
+    RunUMAP(reduction = "pca", dims = 1:PCA_dims)
+  
+  return(se_obj)
+}
+
+# evaluate effect of different clustering resolutions on PCA, UMAP and spatial map
+resolution_sweep <- function(se_obj, vector_with_resolutions, image_use = "raw") {
+  
+  iteration = 0
+  for (res in vector_with_resolutions) {
+    iteration <- iteration + 1
+    print(paste0("Iteration step ", iteration, " : resolution = ", res))
+    
+    # clustering
+    se_obj_cl <- FindClusters(se_obj, resolution = res)
+    
+    # PCA 1
+    pca_plot <- DimPlot(se_obj_cl, reduction = "pca", group.by = "seurat_clusters") +
+    ggtitle(paste("PCA Plot with Seurat Clusters | Resolution =", res))
+    
+    # PCA 2
+    pca_plot_2 <- DimPlot(se_obj_cl, reduction = "pca", group.by = "tissue") +
+    ggtitle(paste("PCA Plot with Tissue Types | Resolution =", res))
+    
+    # UMAP 1
+    umap_plot <- DimPlot(se_obj_cl, reduction = "umap", group.by = "seurat_clusters") +
+    ggtitle(paste("UMAP Plot with Seurat Clusters | Resolution =", res))
+    
+    # UMAP 2
+    umap_plot_2 <- DimPlot(se_obj_cl, reduction = "umap", group.by = "tissue") +
+    ggtitle(paste("UMAP Plot with Tissue Types | Resolution =", res))
+    
+    # Spatial Map
+    spatial_plot <- MapLabels(se_obj_cl, column_name = "seurat_clusters", shape = "tile", 
+                              pt_alpha = 0.7, image_use = image_use, 
+                colors = viridis::turbo(n = length(unique(se_obj_cl$seurat_clusters)))) +
+    guides(fill = guide_legend(override.aes = list(size = 5))) +
+    ggtitle(paste("Spatial Clusters | Resolution =", res))
+    
+    print(pca_plot)
+    print(umap_plot)
+    print(spatial_plot)
+  }
+  print(pca_plot_2)
+  print(umap_plot_2)
+}
+
+# extract number of PCs that explain predefined percentage of variance
+analyze_PCA_dimensions_to_use <- function(seurat_obj, variance_to_explain = 0.9) {
+  
+  # get explained variance
+  stdevs <- seurat_obj[["pca"]]@stdev
+  variance_explained <- (stdevs^2) / sum(stdevs^2)
+  variance_df <- data.frame(PC = 1:length(variance_explained),
+                            VarianceExplained = variance_explained)
+  print(variance_df)
+  
+  # scree plot
+  ggplot(variance_df, aes(x = PC, y = VarianceExplained)) +
+    geom_point() +
+    geom_line() +
+    theme_minimal() +
+    labs(title = "Variance Explained by Each Principal Component",
+         x = "Principal Component",
+         y = "Proportion of Variance Explained")
+  
+  # find number of PCs that explain predefined percentage of variance
+  cumulative_variance <- cumsum(variance_explained)
+  plot(cumulative_variance, type = "b", pch = 16, main = "Cumulative Variance Explained",
+     xlab = "Number of PCs", ylab = "Cumulative Variance Explained")
+  num_pcs <- min(which(cumulative_variance >= variance_to_explain))
+  print(paste0("Number of PCs explaining ", variance_to_explain*100, "% variance: ", num_pcs))
+}
+
+## For data analysis (DGE_diff_normalizations)
+# extracts UMAP coordiantes and cluster labels into a dataframe
+get_umap_df_with_celltypes <- function(seurat_object) {
+  
+  umap_coords <- Embeddings(seurat_object, reduction = "umap")
+  umap_df <- data.frame(UMAP1 = umap_coords[, 1], UMAP2 = umap_coords[, 2], 
+                        celltype = seurat_object@meta.data$seurat_clusters)
+  return(umap_df)
+}
+
+# computes UMAP pairwise distances between points of a specified cluster (cell type)
+get_intra_cluster_distances <- function(df, celltype_name) {
+  celltype_df <- filter(df, celltype == celltype_name)
+  dist_matrix <- as.matrix(dist(cbind(celltype_df$UMAP1, celltype_df$UMAP2)))
+  distances <- dist_matrix[upper.tri(dist_matrix)]
+  return(data.frame(distance = distances))
+}
+
+# computes UMAP distances between points of different clusters (cell types)
+get_inter_cluster_distances <- function(df, celltype_name, max_points = 10000) {
+  type1 <- df %>% filter(celltype == celltype_name)
+  other_types <- df %>% filter(celltype != celltype_name)
+
+  print(paste("Processing Cell Type:", celltype_name))
+  print(paste("Type1 rows:", nrow(type1), "Other Types rows:", nrow(other_types)))
+
+  # combine UMAP coordinates
+  combined_coords <- rbind(cbind(type1$UMAP1, type1$UMAP2), 
+                           cbind(other_types$UMAP1, other_types$UMAP2))
+
+  # reduce dataset size if too large
+  if (nrow(combined_coords) > max_points) {
+    combined_coords <- combined_coords[sample(1:nrow(combined_coords), max_points), ]
+    print(paste("Reducing dataset to", max_points, "points for distance calculation."))
+  }
+
+  print(paste("Total points for distance calculation:", nrow(combined_coords)))
+  print("Computing distance matrix...")
+
+  # compute distance matrix
+  dist_matrix <- as.matrix(parallelDist::parDist(combined_coords, method = "euclidean"))
+
+  return(data.frame(distance = as.vector(dist_matrix)))
+}
+
+# calculates the overlap area between two density distributions of inter- and intra-cluster distances
+calculate_overlap_area <- function(intra_distances, inter_distances) {
+  # calculate the range of distances to consider
+  range_min <- min(min(intra_distances), min(inter_distances))
+  range_max <- max(max(intra_distances), max(inter_distances))
+  range_values <- seq(range_min, range_max, length.out = 1000)  # Adjust length.out as needed
+  
+  # calculate densities
+  density_intra <- density(intra_distances, from = range_min, to = range_max)
+  density_inter <- density(inter_distances, from = range_min, to = range_max)
+  
+  # calculate overlapping area
+  overlap_area <- sum(pmin(density_intra$y, density_inter$y) * diff(density_intra$x[1:2]))
+  return(overlap_area)
+}
+
+# plots the density overlap between intra- and inter-clsuter distances for a cluster(cell type)
+# returns the overlap percentage
+plot_celltype_clusteredness <- function(df, celltype_name) {
+  intra_distances <- get_intra_cluster_distances(df, celltype_name)
+  inter_distances <- get_inter_cluster_distances(df, celltype_name)
+  
+  overlap_perc <- calculate_overlap_area(intra_distances$distance, inter_distances$distance) * 100
+  
+  plot <- ggplot() +
+    geom_density(data = intra_distances, aes(x = distance), fill = "blue", alpha = 0.5) +
+    geom_density(data = inter_distances, aes(x = distance), fill = "red", alpha = 0.5) +
+    ggtitle(paste("Intra- and Inter-Cluster Distances for Cell Type", celltype_name)) +
+    xlab("Distance") +
+    ylab("Density") +
+    theme_minimal() +
+    annotate("text", x = Inf, y = Inf, label = paste("Overlap:", round(overlap_perc, 2), "%"),
+             hjust = 1, vjust = 1, size = 4, color = "black")
+  
+  
+  # print(paste("Cell Type", celltype_name, "finished"))
+  print(plot)
+  return(overlap_perc)
+}
+
+# visualizes the percental overlap of UMAP clusters based on inter- and intra cluster distances
+evaluate_UMAP_clusters <- function(df) {
+  df_perc_overlap_areas <- data.frame("Cell_Type" = character(), 
+                                      "Percental_Overlap" = numeric(),
+                                      stringsAsFactors = FALSE)
+  
+  for (celltype in unique(df$celltype)) {
+    overlap_percentage <- plot_celltype_clusteredness(df, celltype)
+    df_perc_overlap_areas <- rbind(df_perc_overlap_areas, 
+                                   data.frame("Cell_Type" = celltype, 
+                                              "Percental_Overlap" = overlap_percentage))
+    print(paste("Cell Type", celltype, "finished"))
+    gc()
+  }
+  print(df_perc_overlap_areas)
+  
+  # sort the data frame by Percental_Overlap and calculate mean percental overlap
+  df_perc_overlap_areas_sorted <- df_perc_overlap_areas[order(df_perc_overlap_areas$Percental_Overlap, 
+                                                              decreasing = TRUE), ]
+  mean_percental_overlap <- mean(df_perc_overlap_areas_sorted$Percental_Overlap)
+  
+  ggplot(data = df_perc_overlap_areas_sorted, aes(x = reorder(Cell_Type, -Percental_Overlap), 
+                                                  y = Percental_Overlap)) +
+    geom_bar(stat = "identity", fill = "lightblue3") +
+    geom_hline(yintercept = mean_percental_overlap, linetype = "dashed", color = "red") +
+    geom_text(aes(label = sprintf("%.1f%%", Percental_Overlap)), 
+              vjust = -0.5, 
+              color = "black",
+              size = 2.5) +
+    annotate("text", x = length(unique(df_perc_overlap_areas_sorted$Cell_Type)), y = mean_percental_overlap, 
+             label = sprintf("mean: %.1f%%", mean_percental_overlap), 
+             hjust = 0.7, vjust = -1, color = "red", size = 2.8) +
+    labs(title = "Overlap Percentage of Intra- and Inter-Cluster Distances", 
+         x = "Cluster", 
+         y = "Percental Overlap") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1))
+}
+
+# analyzes UMAP directly from seurat object
+evaluate_UMAP_from_seurat_obj <- function(seurat_object) {
+  df <- get_umap_df_with_celltypes(seurat_object)
+  evaluate_UMAP_clusters(df)
+}
+
+# updated function version that does not print overlap areas for each celltype
+evaluate_UMAP_clusters_2 <- function(df) {
+  df_perc_overlap_areas <- data.frame("Cell_Type" = character(), 
+                                      "Percental_Overlap" = numeric(),
+                                      stringsAsFactors = FALSE)
+  
+  for (celltype in unique(df$celltype)) {
+    intra_distances <- get_intra_cluster_distances(df, celltype)
+    inter_distances <- get_inter_cluster_distances(df, celltype)
+    overlap_percentage <- calculate_overlap_area(intra_distances$distance, inter_distances$distance) * 100
+    df_perc_overlap_areas <- rbind(df_perc_overlap_areas, 
+                                   data.frame("Cell_Type" = celltype, 
+                                              "Percental_Overlap" = overlap_percentage))
+    print(paste("Cell Type", celltype, "finished"))
+    gc()
+  }
+  print(df_perc_overlap_areas)
+  
+  # sort the data frame by Percental_Overlap and calculate mean percental overlap
+  df_perc_overlap_areas_sorted <- df_perc_overlap_areas[order(df_perc_overlap_areas$Percental_Overlap, 
+                                                              decreasing = TRUE), ]
+  mean_percental_overlap <- mean(df_perc_overlap_areas_sorted$Percental_Overlap)
+  
+  plot <- ggplot(data = df_perc_overlap_areas_sorted, aes(x = reorder(Cell_Type, -Percental_Overlap), 
+                                                  y = Percental_Overlap)) +
+    geom_bar(stat = "identity", fill = "lightblue3") +
+    geom_hline(yintercept = mean_percental_overlap, linetype = "dashed", color = "red") +
+    geom_text(aes(label = sprintf("%.1f%%", Percental_Overlap)), 
+              vjust = -0.5, 
+              color = "black",
+              size = 2.5) +
+    annotate("text", x = length(unique(df_perc_overlap_areas_sorted$Cell_Type)), y = mean_percental_overlap, 
+             label = sprintf("mean: %.1f%%", mean_percental_overlap), 
+             hjust = 0.7, vjust = -1, color = "red", size = 2.8) +
+    labs(title = "Overlap Percentage of Intra- and Inter-Cluster Distances", 
+         x = "Cluster", 
+         y = "Percental Overlap") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1))
+  print(plot)
+}
+
+# uses the modified evaluate_UMAP_clusters_2 function
+evaluate_UMAP_from_seurat_obj_2 <- function(seurat_object) {
+  df <- get_umap_df_with_celltypes(seurat_object)
+  df$celltype <- as.character(df$celltype)
+  evaluate_UMAP_clusters_2(df)
+}
+
+# functions for original decomposition from 16 µm to 8 µm and 2 µm
+adjust_decomposed_seurat_obj <- function(decomposed_se_obj, decomposed_resolution, se_obj_res16) {
+  # calculate decomposing factor
+  if (decomposed_resolution == 2) {
+    decomposing_factor = 64 # each 16 µm tile creates 64 2 µm tiles
+  } else if (decomposed_resolution == 8) {
+    decomposing_factor = 4 # each 16 µm tile creates 4 8 µm tiles
+  }
+  
+  # get identity and tissue annotation from res16 obj metadata
+  metadata_res16 <- se_obj_res16[[]] |> 
+    filter(!is.na(tissue)) |> 
+    dplyr::select(section, identity, tissue) |> 
+    rownames_to_column(var = "barcode_res16") # have the barcode has its own column
+  
+  # generate mapping dataframe so one knows to which lower resolution tile the decompsoed tiles belong to 
+  tiles_mapping_high_res <- decompose_grid(metadata_res16$barcode_res16, from = 16,
+                                          to = decomposed_resolution,
+                                     coordinates = GetCoordinates(se_obj_res16)) 
+  tiles_mapping_high_res <- data.frame(barcode_res16 = rep(metadata_res16$barcode_res16,
+                                                           each = decomposing_factor),  
+  barcode_high_res = tiles_mapping_high_res)
+  
+  # update barcodes for lower resolutions to match to the decomposed ones 
+  tiles_mapping_high_res$barcode_high_res <- paste0(tiles_mapping_high_res$barcode_high_res,
+                                                    "-1") 
+  
+  # merge metadata from lower res into decomposed barcodes
+  metadata_high_res <- tiles_mapping_high_res |> 
+    left_join(metadata_res16, by = "barcode_res16") |> 
+    dplyr::select(barcode_high_res, section, identity, tissue)
+  
+  # subset higher resoltion object and assign metadata
+  se.hd_high_res <- SubsetSTData(decomposed_se_obj, spots = metadata_high_res$barcode_high_res)
+  
+  # rownames to column before merging metadata and add section, tissue and identity info
+  metadata_high_res_df <- se.hd_high_res[[]] |> 
+    rownames_to_column(var = "barcode_high_res") |> 
+    left_join(metadata_high_res, by = "barcode_high_res")
+  
+  # convert back to Seurat metadata format and assign updated metadata back
+  rownames(metadata_high_res_df) <- metadata_high_res_df$barcode_high_res
+  metadata_high_res_df <- metadata_high_res_df |> dplyr::select(-barcode_high_res)  # remove extra column
+  se.hd_high_res[[]] <- metadata_high_res_df
+
+  # sanity check
+  print(se.hd_high_res[[]])
+
+  return(se.hd_high_res)
+}
+
+# updated version to allow decompositon from 8 µm to 2 µm but also to specify metadata columns to add
+adjust_decomposed_seurat_obj_2 <- function(decomposed_se_obj, decomposed_resolution, original_se_obj, original_resolution, metadata_columns = c("section", "identity", "tissue")) {
+  # ensure valid resolutions
+  if (decomposed_resolution >= original_resolution) {
+    stop("Decomposed resolution must be finer than the original resolution")
+  }
+  
+  # calculate decomposing factor
+  decomposing_factor <- (original_resolution / decomposed_resolution)^2
+  
+  # get identity and tissue annotation from original object metadata
+  metadata_original <- original_se_obj[[]] |> 
+    filter(!is.na(tissue)) |> 
+    dplyr::select(all_of(metadata_columns)) |> 
+    rownames_to_column(var = "barcode_original") # have the barcode as its own column
+  
+  # generate mapping dataframe so one knows which lower resolution tile the decomposed tiles belong to 
+  tiles_mapping_high_res <- decompose_grid(metadata_original$barcode_original, 
+                                           from = original_resolution,
+                                           to = decomposed_resolution,
+                                           coordinates = GetCoordinates(original_se_obj)) 
+  tiles_mapping_high_res <- data.frame(barcode_original = rep(metadata_original$barcode_original, 
+                                                              each = decomposing_factor),  
+                                       barcode_high_res = tiles_mapping_high_res)
+  
+  # update barcodes for lower resolutions to match the decomposed ones 
+  tiles_mapping_high_res$barcode_high_res <- paste0(tiles_mapping_high_res$barcode_high_res, "-1")
+  
+  # merge metadata from original resolution into decomposed barcodes
+  metadata_high_res <- tiles_mapping_high_res |> 
+    left_join(metadata_original, by = "barcode_original") |> 
+    dplyr::select(all_of(c("barcode_high_res", metadata_columns)))
+  
+  # subset higher resolution object and assign metadata
+  se.hd_high_res <- SubsetSTData(decomposed_se_obj, spots = metadata_high_res$barcode_high_res)
+  
+  # convert metadata to Seurat format and update metadata in decomposed object
+  metadata_high_res_df <- se.hd_high_res[[]] |> 
+    rownames_to_column(var = "barcode_high_res") |> 
+    left_join(metadata_high_res, by = "barcode_high_res")
+  
+  rownames(metadata_high_res_df) <- metadata_high_res_df$barcode_high_res
+  metadata_high_res_df <- metadata_high_res_df |> dplyr::select(-barcode_high_res)  # remove extra column
+  se.hd_high_res[[]] <- metadata_high_res_df
+
+  # sanity check
+  print(se.hd_high_res[[]])
+
+  return(se.hd_high_res)
+}
+
+# show PCA + UMAP, and clusters separately for the embryonic sections
+show_clusters <- function(se_obj, cluster_column) {
+  print(DimPlot(se_obj, reduction = "pca", label = TRUE))
+  print(DimPlot(se_obj, reduction = "umap", label = TRUE))
+  
+  print(MapLabels(SubsetSTData(se_obj, section == "A"), column_name = cluster_column, shape = "tile"))
+  print(MapLabels(SubsetSTData(se_obj, section == "B"), column_name = cluster_column, shape = "tile"))
+  print(MapLabels(SubsetSTData(se_obj, section == "C"), column_name = cluster_column, shape = "tile"))
+  print(MapLabels(SubsetSTData(se_obj, section == "D"), column_name = cluster_column, shape = "tile"))
+}
+```
+
+## Load filtered seurat objects for resolution 2, 8, and 16 µm
+
+-   the filtered objects had apart from the visual filtering that both objects have, also a UMI (\>100), gene (\>75) and mt.content (\<20%) filtering in resolution 16 µm which was then decomposed to the other filtered high resolution objects
+
+```{r}
+# load the saved objects
+se.hd_res16_filt <- readRDS(file.path(input.dir, "se.hd_res16_filt.rds"))
+se.hd_res8_filt <- readRDS(file.path(input.dir, "se.hd_res8_filt.rds"))
+se.hd_res2_filt <- readRDS(file.path(input.dir, "se.hd_res2_filt.rds"))
+```
+
+## Prepare Seurat objects for clustering
+
+-   the objects need to be normalized etc.
+
+    -   choice between log normalization (NormalizeData) and SCTransform
+
+    -   choice of how many PCA dimensions to use
+
+    -   choice of cluster resolution
+
+-   sweeping over possible resolution allows to find ideal resolution for finding clusters
+
+```{r}
+resolutions <- c(0.1, 0.2, 0.3, 0.4, 0.5, 1.0)
+```
+
+## Clustering at resolution 16 µm
+
+### A) Filtered seurat object + log normalization
+
+#### Using 10 PCA dimensions (default)
+
+```{r}
+se.hd_res16_filt_log <- prepare_seurat_obj(se.hd_res16_filt, mode = "log")
+```
+
+```{r}
+ElbowPlot(se.hd_res16_filt_log) 
+analyze_PCA_dimensions_to_use(se.hd_res16_filt_log)
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res16_filt_log, resolutions) # resolution 0.4 distinguishes between neural tube and somites
+```
+
+#### Using 24 PCA dimensions (explain 90% of variance)
+
+```{r}
+se.hd_res16_filt_log_PCA24 <- prepare_seurat_obj(se.hd_res16_filt, mode = "log", PCA_dims = 24)
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res16_filt_log_PCA24, resolutions) #0.3 and 0.4 is nice
+```
+
+```{r, fig.height = 8, fig.width = 8}
+resolution_sweep(se.hd_res16_filt_log_PCA24, c(0.3, 0.4))
+```
+
+#### Unbiased UMAP evaluation
+
+```{r}
+se.hd_res16_filt_log_cl_0.4 <- prepare_seurat_obj(se.hd_res16_filt, mode = "log",
+                                                  cluster_resolution = 0.4)
+
+se.hd_res16_filt_log_PCA24_cl_0.3 <- prepare_seurat_obj(se.hd_res16_filt, mode = "log",
+                                                        PCA_dims = 24,
+                                                        cluster_resolution = 0.3)
+
+se.hd_res16_filt_log_PCA24_cl_0.4 <- prepare_seurat_obj(se.hd_res16_filt, mode = "log",
+                                                        PCA_dims = 24,
+                                                        cluster_resolution = 0.4)
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res16_filt_log_cl_0.4)
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res16_filt_log_PCA24_cl_0.3)
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res16_filt_log_PCA24_cl_0.4)
+```
+
+### B) Filtered seurat object + sct normalization
+
+#### Using 10 PCA dimensions
+
+```{r}
+se.hd_res16_filt_sct <- prepare_seurat_obj(se.hd_res16_filt, mode = "sct")
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res16_filt_sct, resolutions) # does not distinguish between neural tube and somites
+```
+
+```{r}
+ElbowPlot(se.hd_res16_filt_sct)
+analyze_PCA_dimensions_to_use(se.hd_res16_filt_sct)
+```
+
+#### Using 18 dimensions (explain 90% of the variance)
+
+```{r}
+se.hd_res16_filt_sct_PCA18 <- prepare_seurat_obj(se.hd_res16_filt, mode = "sct", PCA_dims = 18)
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res16_filt_sct_PCA18, resolutions) # 0.2 and 0.3 is good
+```
+
+#### Unbiased UMAP evaluation
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res16_filt_sct_PCA18) # res 0.2
+```
+
+```{r}
+se.hd_res16_filt_sct_PCA18_cl_0.3 <- prepare_seurat_obj(se.hd_res16_filt, mode = "sct",
+                                                        PCA_dims = 18, 
+                                                        cluster_resolution = 0.3)
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res16_filt_sct_PCA18_cl_0.3) 
+```
+
+```{r}
+se.hd_res16_filt_sct_PCA18_cl_0.4 <- prepare_seurat_obj(se.hd_res16_filt, mode = "sct",
+                                                        PCA_dims = 18, 
+                                                        cluster_resolution = 0.4)
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res16_filt_sct_PCA18_cl_0.4)
+```
+
+## Clustering at resolution 8 µm
+
+### A) Filtered seurat object + log normalization
+
+#### Using 10 PCA dimensions (default)
+
+```{r, fig.asp = 1}
+se.hd_res8_filt_log <- prepare_seurat_obj(se.hd_res8_filt, mode = "log")
+```
+
+```{r}
+ElbowPlot(se.hd_res8_filt_log) # 10 PCs look reasonable
+analyze_PCA_dimensions_to_use(se.hd_res8_filt_log)
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res8_filt_log, resolutions) # not able to distinguish neural tube and somites
+```
+
+-   the resolutions sweep shows mediocre results (e.g. neural tube cannot be distinguished from somites)
+
+-   alternative approach: find components which explain 90% of the variance
+
+```{r}
+analyze_PCA_dimensions_to_use(se.hd_res8_filt_log)
+```
+
+-   29 PCs explain 90% of variance –\> we should try to go higher than 10 PCs
+
+#### Using 15 PCA dimensions
+
+```{r}
+se.hd_res8_filt_PCA15 <- prepare_seurat_obj(se.hd_res8_filt, mode = "log", PCA_dims = 15)
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res8_filt_PCA15, resolutions) # I like 0.2 + but not very detailed
+```
+
+-   resolutions 0.2 seem okay but not ideal (e.g. cluster 7)
+
+    -   other resolutions cant distinguish between neural tube and somites
+
+#### Using 29 PCA dimensions (explain 90% of variance)
+
+```{r}
+se.hd_res8_filt_PCA29 <- prepare_seurat_obj(se.hd_res8_filt, mode = "log", PCA_dims = 29)
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res8_filt_PCA29, resolutions)
+```
+
+```{r, fig.height = 8, fig.width = 8}
+resolution_sweep(se.hd_res8_filt_PCA29, c(0.2, 0.3), image_use = NULL)
+```
+
+-   resolution 0.2 and 0.3 are very nice
+
+-   While 0.3 gives more clusters, it also clusters more in the yolk sac and perinatal tissue which was not desired as much
+
+    -   resolutions in between were also tried out but did not give desired results
+
+#### Using 22 PCA dimensions (explain 85% of variance)
+
+```{r}
+se.hd_res8_filt_PCA22<- prepare_seurat_obj(se.hd_res8_filt, mode = "log", PCA_dims = 22)
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res8_filt_PCA22, resolutions)  
+```
+
+-   resolution 0.3 could be good using 22 PCA dimensions
+
+#### Unbiased UMAP Evaluation
+
+**Clustering resolution 0.2**
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res8_filt_log) # 10 PCA dimensions # resolution 0.2
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res8_filt_PCA15) # resolution 0.2
+
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res8_filt_PCA29) # resolution 0.2
+```
+
+**Clustering resolution 0.3**
+
+```{r}
+se.hd_res8_filt_log_PCA29_cl_0.3 <- prepare_seurat_obj(se.hd_res8_filt, mode = "log",
+                                                      PCA_dims = 29, cluster_resolution = 0.3)
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res8_filt_log_PCA29_cl_0.3)
+```
+
+```{r}
+se.hd_res8_filt_log_PCA22_cl_0.3 <- prepare_seurat_obj(se.hd_res8_filt, mode = "log",
+                                                      PCA_dims = 22, cluster_resolution = 0.3)
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res8_filt_log_PCA22_cl_0.3)
+```
+
+### B) Filtered seurat object + sct normalization
+
+#### Using 10 PCA dimensions (default)
+
+```{r}
+se.hd_res8_filt_sct <- prepare_seurat_obj(se.hd_res8_filt, mode = "sct") #10 PCs
+```
+
+```{r}
+ElbowPlot(se.hd_res8_filt_sct)
+analyze_PCA_dimensions_to_use(se.hd_res8_filt_sct)
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res8_filt_sct, resolutions) # quite bad since it does not find the neural tube 
+```
+
+-   bad since the neural tube is not recognized
+
+#### Using 23 PCA dimensions (explain 90% of variance)
+
+```{r}
+se.hd_res8_filt_sct_PCA_23 <- prepare_seurat_obj(se.hd_res8_filt_sct, mode = "sct", PCA_dims = 23) # explain 90% of variance
+```
+
+```{r, fig.asp = 1}
+resolution_sweep(se.hd_res8_filt_sct_PCA_23, resolutions) # 0.2 is really good, also maybe 0.4; but not 0.3 since it does not distinguish between neural tube and somites
+```
+
+#### Unbiased UMAP Evaluation
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res8_filt_sct_PCA_23)
+```
+
+```{r}
+se.hd_res8_filt_sct_PCA_23_cl_0.4 <- prepare_seurat_obj(se.hd_res8_filt, mode = "sct",
+                                                        PCA_dims = 23,
+                                                        cluster_resolution = 0.4) 
+```
+
+```{r}
+evaluate_UMAP_from_seurat_obj_2(se.hd_res8_filt_sct_PCA_23_cl_0.4)
+```
+
+#### Preliminary winner:
+
+-   log normalization with 29 PCA dimensions –\> I can save resolution 0.2 and 0.3 for further analyses
+
+## Clustering at resolution 2 µm
+
+-   to reduce the data size, only the main body of section A is analyzed
+
+```{r}
+se.hd_res2_filt_main_body <- SubsetSTData(se.hd_res2_filt, tissue == "main_body")
+```
+
+```{r}
+se.hd_res2_filt_main_body_section_A <- SubsetSTData(se.hd_res2_filt_main_body, section == "A")
+```
+
+```{r}
+se.hd_res2_filt_main_body_section_A_log <- prepare_seurat_obj(se.hd_res2_filt_main_body_section_A, mode = "log", cluster_resolution = 0.5)
+```
+
+```{r}
+ElbowPlot(se.hd_res2_filt_main_body_section_A_log)
+analyze_PCA_dimensions_to_use(se.hd_res2_filt_main_body_section_A_log)
+```
+
+```{r, fig.height = 15, fig.width = 15}
+resolutions_3 <- c(0.2)
+resolution_sweep(se.hd_res2_filt_main_body_section_A_log, resolutions_3, image_use = NULL)
+```
+
+-   very noisy
+
+```{r}
+DimPlot(se.hd_res2_filt_main_body_section_A_log, reduction = "umap")
+```
+
+## Clustering at resolution 2 - only somites and neural tube (across all sections)\`
+
+-   create res 2 µm object based on resolution 8 µm object (log normalization and 29 PCA dims)
+
+```{r}
+se.hd_res8_filt_neural_tube_and_somites <- SubsetSTData(se.hd_res8_filt_log_PCA29_cl_0.3, Spatial_snn_res.0.3 %in% c(13, 14)) # 13 is neural tube; 14 is somites
+```
+
+```{r}
+MapLabels(se.hd_res8_filt_neural_tube_and_somites, column_name = "section", shape = "tile")
+```
+
+```{r}
+se.hd_res2_neural_tube_and_somites <- adjust_decomposed_seurat_obj_2(decomposed_se_obj = se.hd_res2_filt, decomposed_resolution = 2, 
+                                                                     original_se_obj = se.hd_res8_filt_neural_tube_and_somites, original_resolution = 8,
+                                                                     metadata_columns = c("Spatial_snn_res.0.3")) 
+```
+
+-   using log normalization for res2 object and desired used PCA dims
+
+```{r}
+se.hd_res2_neural_tube_and_somites_prepared <- prepare_seurat_obj(se.hd_res2_neural_tube_and_somites,
+                                                         mode = "log", PCA_dims = 45,
+                                                         cluster_resolution = 0.2)
+```
+
+```{r}
+ElbowPlot(se.hd_res2_neural_tube_and_somites_prepared, ndims = 50)
+analyze_PCA_dimensions_to_use(se.hd_res2_neural_tube_and_somites_prepared)
+```
+
+```{r, fig.height = 12, fig.width = 12}
+show_clusters(se.hd_res2_neural_tube_and_somites_prepared, cluster_column = "Spatial_snn_res.0.2")
+clusters <- as.numeric(as.character(se.hd_res2_neural_tube_and_somites_prepared[[]]$Spatial_snn_res.0.2))
+
+
+for (cluster in sort(unique(clusters))) {
+  print(MapLabels(SubsetSTData(se.hd_res2_neural_tube_and_somites_prepared, Spatial_snn_res.0.2 == cluster), column_name =  "Spatial_snn_res.0.2", shape = "tile",
+                  image_use = "raw", crop_area = c(0.2693,0.25,0.305,0.294))) # #& section == "A" #error stems from not all clusters being in this section...  
+}
+```
+
+-   using SCTransform and desired PCA dimensions
+
+```{r}
+# remove spots with zero counts
+se.hd_res2_neural_tube_and_somites_filtered <- SubsetSTData(se.hd_res2_neural_tube_and_somites, nCount_Spatial > 0)
+```
+
+```{r}
+se.hd_res2_neural_tube_and_somites_sct <- prepare_seurat_obj(se.hd_res2_neural_tube_and_somites_filtered, mode = "sct", PCA_dims = 30, 
+                                                             cluster_resolution = 0.25, 
+                                                             vars.to.regress = NULL)
+```
+
+```{r, fig.height = 11, fig.width = 11}
+show_clusters(se.hd_res2_neural_tube_and_somites_sct, cluster_column = "SCT_snn_res.0.25")
+```
+
+```{r, fig.asp = 1}
+for (cluster in unique(se.hd_res2_neural_tube_and_somites_sct[[]]$SCT_snn_res.0.25)) {
+  print(MapLabels(SubsetSTData(se.hd_res2_neural_tube_and_somites_sct, SCT_snn_res.0.25 == cluster), column_name =  "SCT_snn_res.0.25",
+                  image_use = "raw", crop_area = c(0.2693,0.25,0.305,0.294)))
+}
+```
+
+## Session Info
+
+```{r}
+date()
+sessionInfo()
+```
